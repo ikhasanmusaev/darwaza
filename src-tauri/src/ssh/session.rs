@@ -119,6 +119,9 @@ pub enum SessionEvent {
 /// Хэндл сессии, хранится в `SshManager`.
 pub struct SessionHandle {
     pub host_id: i64,
+    /// Соединение только для файлов (экран SFTP): без терминала и оболочки.
+    /// Во вкладки и в список «активных сессий» не попадает.
+    pub files_only: bool,
     pub status: SessionStatus,
     pub cmd_tx: mpsc::Sender<SessionCmd>,
 }

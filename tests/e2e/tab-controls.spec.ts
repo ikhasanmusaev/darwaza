@@ -253,6 +253,22 @@ test.describe("копирование и вставка: Ctrl+Shift+C/V, Ctrl+In
     expect(sent.join("").split("один").length - 1).toBe(1);
   });
 
+  test("голый Ctrl+V шлёт в оболочку только ^V и ничего не вставляет", async ({ page, context }) => {
+    const sent: string[] = [];
+    await ready(page, context, sent);
+    await page.evaluate(() => navigator.clipboard.writeText("секрет"));
+    await page.keyboard.press("Control+KeyV");
+    // WebKitGTK запускал ещё и собственную вставку — имитируем её.
+    await page.locator(".xterm-helper-textarea").last().evaluate((el) => {
+      const dt = new DataTransfer();
+      dt.setData("text/plain", "секрет");
+      el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
+    });
+    await expect.poll(() => JSON.stringify(sent)).toBe(JSON.stringify(["\u0016"]));
+    await page.waitForTimeout(500);
+    expect(sent.join("")).toBe("\u0016");
+  });
+
   test("Ctrl+Insert копирует выделение и не уходит в оболочку", async ({ page, context }) => {
     const sent: string[] = [];
     await ready(page, context, sent);
@@ -261,6 +277,50 @@ test.describe("копирование и вставка: Ctrl+Shift+C/V, Ctrl+In
     await page.keyboard.press("Control+Insert");
     await expect.poll(() => copies(page)).toEqual(["world"]);
     expect(sent.join("")).not.toContain("\u001b");
+  });
+
+  test("текст из другого приложения вставляется через Rust, даже если WebView буфер не отдаёт", async ({ page, context }) => {
+    const sent: string[] = [];
+    // Как в WebKitGTK на Wayland: readText видит только «свой» текст.
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    await mockTauriInvoke(page, {
+      ...makeHandlers(sent),
+      clipboard_read_text: () => "из браузера",
+    });
+    await page.addInitScript(() => {
+      navigator.clipboard.readText = () => Promise.resolve("");
+    });
+    await page.goto("/hosts");
+    await openHost(page, "alpha", 1);
+    await emitTauriEvent(page, "session:status", { sessionId: "tabs-session-1", status: "CONNECTED", error: null });
+    await page.locator(".xterm-helper-textarea").last().focus();
+
+    await page.keyboard.press("Control+Shift+V");
+    await expect.poll(() => sent.join("")).toContain("из браузера");
+    await page.keyboard.press("Shift+Insert");
+    await expect.poll(() => sent.join("").split("из браузера").length - 1).toBe(2);
+    await page.waitForTimeout(300);
+    expect(sent.join("").split("из браузера").length - 1).toBe(2);
+  });
+
+  test("если Rust не смог прочитать буфер, берётся WebView, а ошибка попадает в консоль", async ({ page, context }) => {
+    const sent: string[] = [];
+    const warnings: string[] = [];
+    page.on("console", (m) => { if (m.type() === "warning") warnings.push(m.text()); });
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    await mockTauriInvoke(page, {
+      ...makeHandlers(sent),
+      clipboard_read_text: () => { throw new Error("владелец буфера не ответил"); },
+    });
+    await page.goto("/hosts");
+    await openHost(page, "alpha", 1);
+    await emitTauriEvent(page, "session:status", { sessionId: "tabs-session-1", status: "CONNECTED", error: null });
+    await page.evaluate(() => navigator.clipboard.writeText("запасной"));
+    await page.locator(".xterm-helper-textarea").last().focus();
+
+    await page.keyboard.press("Control+Shift+V");
+    await expect.poll(() => sent.join("")).toContain("запасной");
+    expect(warnings.join("\n")).toContain("владелец буфера не ответил");
   });
 
   test("Shift+Insert вставляет один раз и не шлёт Insert в оболочку", async ({ page, context }) => {
@@ -388,7 +448,7 @@ test.describe("S145 — восстановление вкладок", () => {
   test("вкладки возвращаются после перезапуска", async ({ page }) => {
     // Настройки живут в состоянии обработчиков, как в настоящем backend:
     // приложение закрылось, а список открытых хостов остался в базе.
-    const settings: Record<string, string> = {};
+    const settings: Record<string, string> = { "session.restore_tabs": "true" };
     const handlers = {
       ...makeHandlers(),
       settings_all: () => settings,
@@ -413,7 +473,7 @@ test.describe("S145 — восстановление вкладок", () => {
   test("восстановление идёт по очереди: второй хост ждёт, пока определится первый (#234)", async ({
     page,
   }) => {
-    const settings: Record<string, string> = { "session.open_hosts": "[1,2]" };
+    const settings: Record<string, string> = { "session.restore_tabs": "true", "session.open_hosts": "[1,2]" };
     const connects: number[] = [];
     let firstIsUp = false;
     const handlers = {
@@ -447,6 +507,30 @@ test.describe("S145 — восстановление вкладок", () => {
     firstIsUp = true;
     await expect(page.getByTestId("session-tab")).toHaveCount(2);
     expect(connects).toEqual([1, 2]);
+  });
+
+  test("по умолчанию настройка выключена: чистый запуск, сохранённый список цел", async ({ page }) => {
+    // Настройка никогда не включалась, а список от прежней версии лежит в базе.
+    const settings: Record<string, string> = { "session.open_hosts": "[1,2]" };
+    await mockTauriInvoke(page, {
+      ...makeHandlers(),
+      settings_all: () => settings,
+      settings_get: (args?: any) => settings[args?.key] ?? null,
+      settings_set: (args?: any) => {
+        settings[args.key] = args.value;
+      },
+    });
+    await page.goto("/hosts");
+    await expect(page.getByTestId("session-tab")).toHaveCount(0);
+
+    // Открыли и закрыли вкладку вручную — сохранённый список не стёрт.
+    await openHost(page, "alpha", 1);
+    await expect(page.getByTestId("session-tab")).toHaveCount(1);
+    expect(settings["session.open_hosts"]).toBe("[1,2]");
+
+    // В настройках переключатель выключен.
+    await page.goto("/settings");
+    await expect(page.getByTestId("restore-tabs")).not.toBeChecked();
   });
 
   test("выключенное восстановление не открывает ничего", async ({ page }) => {

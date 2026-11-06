@@ -17,6 +17,7 @@ import {
   Trash2,
 } from "lucide-vue-next";
 import { errorText } from "../lib/errors";
+import { readClipboardText } from "../api/clipboard";
 import { useSessionsStore } from "../stores/sessions";
 import { useSettingsStore } from "../stores/settings";
 import { useBookmarksStore } from "../stores/bookmarks";
@@ -217,12 +218,9 @@ onMounted(() => {
   function pasteFromClipboard() {
     if (!isInteractive.value) return;
     suppressNativePasteUntil = performance.now() + 400;
-    navigator.clipboard
-      .readText()
-      .then((txt) => {
-        if (txt) term?.paste(txt);
-      })
-      .catch(() => undefined);
+    void readClipboardText().then((txt) => {
+      if (txt) term?.paste(txt);
+    });
   }
 
   // Copy/paste keyboard (xterm.js v5 пропускает их через customHandlers)
@@ -233,11 +231,23 @@ onMounted(() => {
     // (`e.key`): при кириллической раскладке `key` — «ц», «м», «а», и привязка
     // к латинице молча не срабатывала. Обычный ввод не затронут: везде нужен Ctrl.
 
-    // Голые Ctrl+C и Ctrl+V здесь НЕ перехватываются — решение владельца
-    // (2026-08-31). Ctrl+C обязан прерывать команду, и подменять его копией
-    // при выделении значит отнимать у человека единственный способ остановить
-    // зависший процесс ровно тогда, когда он торопится. Копия и вставка живут
-    // на Ctrl+Shift+C и Ctrl+Shift+V — так принято в терминалах.
+    // Голый Ctrl+C не перехватывается — решение владельца (2026-08-31): он
+    // обязан прерывать команду, и подменять его копией значит отнимать у
+    // человека единственный способ остановить зависший процесс. Копия и
+    // вставка живут на Ctrl+Shift+C и Ctrl+Shift+V — так принято в терминалах.
+    //
+    // Голый Ctrl+V (решение владельца, 2026-11-02) ничего не вставляет: в
+    // оболочку уходит ^V (0x16, «quoted-insert»). WebKitGTK при этом запускал
+    // ещё и собственную вставку, поэтому её гасим — как и у Ctrl+Shift+V.
+    if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey && e.code === "KeyV") {
+      e.preventDefault();
+      e.stopPropagation();
+      suppressNativePasteUntil = performance.now() + 400;
+      if (isInteractive.value) {
+        store.send(props.sessionId, encoder.encode("\x16")).catch(() => undefined);
+      }
+      return false;
+    }
 
     // Ctrl+W закрывает вкладку и до оболочки доходить не должен: там это
     // «стереть слово», и человек терял бы слово в набранной команде.

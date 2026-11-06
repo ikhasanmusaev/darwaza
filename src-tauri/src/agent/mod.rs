@@ -25,12 +25,20 @@ const TOKEN_BYTES: usize = 32;
 
 /// Где лежит токен. Права `0600`, как у приватного ключа.
 pub fn token_path() -> Result<PathBuf> {
+    Ok(crate::paths::local_state_dir()?.join("agent-token"))
+}
+
+/// Где токен лежал до 0.1.1 на Windows: каталог данных (Roaming). Нужен
+/// только затем, чтобы убрать оттуда старый токен.
+#[cfg(windows)]
+fn roaming_token_path() -> Result<PathBuf> {
     Ok(crate::paths::state_dir()?.join("agent-token"))
 }
 
 /// Где слушаем. Предпочитаем каталог времени выполнения: он создаётся с
 /// правами только для владельца и очищается при выходе из системы, то есть
 /// забытый сокет не переживёт перезагрузку.
+#[cfg(unix)]
 pub fn socket_path() -> Result<PathBuf> {
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
         let dir = PathBuf::from(runtime).join("darwaza");
@@ -47,9 +55,33 @@ pub fn socket_path() -> Result<PathBuf> {
 /// котором его успеет прочитать посторонний.
 pub fn ensure_token() -> Result<String> {
     let path = token_path()?;
+    // Старый токен из Roaming не оставляем лежать: его могли скопировать
+    // вместе с профилем на другую машину, и он не должен остаться рабочим.
+    #[cfg(windows)]
+    {
+        if let Ok(old) = roaming_token_path() {
+            if old != path {
+                std::fs::remove_file(old).ok();
+            }
+        }
+    }
+    ensure_token_at(&path)
+}
+
+/// То же для заданного файла. Отдельно от `ensure_token` затем, чтобы тест
+/// мог работать во временной папке и не трогать настоящий токен разработчика
+/// (и не удалять его старую копию в Roaming на Windows).
+pub fn ensure_token_at(path: &std::path::Path) -> Result<String> {
+    let path = path.to_path_buf();
     if let Ok(existing) = std::fs::read_to_string(&path) {
         let trimmed = existing.trim().to_string();
         if !trimmed.is_empty() {
+            // Токен мог быть создан прежней версией с правами каталога.
+            #[cfg(windows)]
+            {
+                crate::winsec::restrict_to_current_user(&path)
+                    .with_context(|| format!("права на {}", path.display()))?;
+            }
             return Ok(trimmed);
         }
     }
@@ -84,8 +116,15 @@ fn write_private(path: &std::path::Path, contents: &str) -> Result<()> {
 
 #[cfg(not(unix))]
 fn write_private(path: &std::path::Path, contents: &str) -> Result<()> {
-    // На Windows права задаются иначе; пока просто пишем — сборки под неё нет.
-    std::fs::write(path, contents).with_context(|| format!("создание {}", path.display()))
+    // Сначала пустой файл и замок на него, потом секрет: в обратном порядке
+    // осталось бы окно, в котором токен лежит с правами каталога.
+    std::fs::write(path, "").with_context(|| format!("создание {}", path.display()))?;
+    #[cfg(windows)]
+    {
+        crate::winsec::restrict_to_current_user(path)
+            .with_context(|| format!("права на {}", path.display()))?;
+    }
+    std::fs::write(path, contents).with_context(|| format!("запись {}", path.display()))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -169,6 +208,48 @@ mod gone_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Echo;
+
+    #[async_trait::async_trait]
+    impl AgentHandler for Echo {
+        async fn handle(&self, method: &str, _params: serde_json::Value) -> AgentResponse {
+            AgentResponse::ok(serde_json::json!({ "echo": method }))
+        }
+    }
+
+    /// Обмен по любому потоку байтов, а не только по unix-сокету: на нём же
+    /// держится именованный канал Windows (#160), который на Linux не поднять.
+    #[tokio::test]
+    async fn connection_logic_works_over_any_byte_stream() {
+        let (client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(serve_connection(server, Arc::new(Echo), "tok".into()));
+
+        let (read, mut write) = tokio::io::split(client);
+        let mut lines = BufReader::new(read).lines();
+        write
+            .write_all(b"{\"token\":\"tok\",\"method\":\"hosts.list\"}\n{\"token\":\"bad\",\"method\":\"x\"}\n")
+            .await
+            .unwrap();
+        let ok: serde_json::Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(ok["result"]["echo"].as_str(), Some("hosts.list"));
+        let refused: serde_json::Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(refused["error"].as_str(), Some("доступ не разрешён"));
+
+        drop(write);
+        drop(lines);
+        task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn pipe_name_hides_the_token() {
+        let name = pipe_name("secret-token");
+        assert!(name.starts_with(r"\\.\pipe\darwaza-agent-"));
+        assert!(!name.contains("secret"));
+        assert_ne!(name, pipe_name("another-token"));
+    }
 
     #[test]
     fn token_is_long_enough_to_be_pointless_to_guess() {
@@ -332,19 +413,90 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{info, warn};
 
-/// На системах без unix-сокетов канала агента пока нет (#160).
+/// Имя канала агента на Windows (#160).
 ///
-/// Отдельная заглушка, а не `#[cfg]` вокруг вызова: приложение обязано
-/// собираться и работать под Windows целиком, просто без доступа агента.
-/// Молчать нельзя — иначе человек будет искать, почему MCP не отвечает, —
-/// поэтому причина уходит в журнал обычным путём, как любая неудача канала.
+/// Именованные каналы Windows живут в одном общем пространстве имён на всю
+/// машину, и создать канал с любым именем может кто угодно. Если бы имя было
+/// постоянным, посторонний пользователь мог бы занять его раньше нас, и
+/// `darwaza-mcp` отдал бы ему токен вместе с первым же запросом. Поэтому имя
+/// выводится из токена: хеш, по которому токен не восстановить, а имя без
+/// токена не угадать. Токен при этом всё равно проверяется в каждом запросе.
 ///
-/// Порт на именованные каналы Windows — отдельная задача: у них другая модель
-/// прав, и «просто заменить тип» здесь не работает, права на сокет мы
-/// проверяем сами.
-#[cfg(not(unix))]
-pub async fn serve(_handler: Arc<dyn AgentHandler>, _token: String) -> Result<PathBuf> {
-    anyhow::bail!("канал агента пока доступен только на Linux и macOS")
+/// Функция чистая и доступна на всех системах — её проверяет обычный тест.
+/// Посредник `darwaza-mcp` повторяет её намеренно (см. там).
+pub fn pipe_name(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("darwaza-agent-pipe:{token}").as_bytes());
+    format!(r"\\.\pipe\darwaza-agent-{}", &hex(&digest)[..32])
+}
+
+/// Поднять слушатель на именованном канале Windows.
+#[cfg(windows)]
+pub async fn serve(handler: Arc<dyn AgentHandler>, token: String) -> Result<PathBuf> {
+    let name = pipe_name(&token);
+    serve_pipe(name, handler, token).await
+}
+
+/// Поднять слушатель на заданном имени канала. Имя параметром — по той же
+/// причине, что и путь в `serve_at`: тесты не должны драться за один канал.
+#[cfg(windows)]
+pub async fn serve_pipe(
+    name: String,
+    handler: Arc<dyn AgentHandler>,
+    token: String,
+) -> Result<PathBuf> {
+    use crate::winsec::create_owner_only_pipe;
+    use tokio::net::windows::named_pipe::NamedPipeServer;
+
+    // Первый экземпляр создаётся с `first_pipe_instance`: если канал с этим
+    // именем уже есть, создание не удастся — не станем слушать поверх чужого.
+    // Удалённые клиенты (по SMB) не допускаются, а список доступа — только
+    // текущему пользователю: имена каналов видны всем, и умолчание системы
+    // (чтение для всех) здесь не годится. Список не построился — канал не
+    // поднимается вовсе.
+    let mut server = create_owner_only_pipe(&name, true)
+        .with_context(|| format!("не удалось занять {name}: приложение запущено дважды?"))?;
+    info!(target: "agent", "слушаю {name}");
+
+    let pipe = name.clone();
+    tokio::spawn(async move {
+        let next_instance = || -> std::io::Result<NamedPipeServer> {
+            create_owner_only_pipe(&pipe, false)
+        };
+        loop {
+            if let Err(e) = server.connect().await {
+                // Одна неудачная попытка не повод переставать слушать.
+                warn!(target: "agent", "не принял соединение на {pipe}: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if let Ok(fresh) = next_instance() {
+                    server = fresh;
+                }
+                continue;
+            }
+            // Следующий экземпляр поднимаем ДО передачи этого в работу: иначе
+            // между двумя клиентами канал на мгновение исчезает, и второй
+            // получает «не запущено».
+            let connected = server;
+            server = loop {
+                match next_instance() {
+                    Ok(fresh) => break fresh,
+                    Err(e) => {
+                        warn!(target: "agent", "не создал следующий экземпляр {pipe}: {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                }
+            };
+            let handler = handler.clone();
+            let token = token.clone();
+            tokio::spawn(async move {
+                if let Err(e) = serve_connection(connected, handler, token).await {
+                    warn!(target: "agent", "соединение оборвалось: {e}");
+                }
+            });
+        }
+    });
+
+    Ok(PathBuf::from(name))
 }
 
 /// Что умеет обработчик запросов агента.
@@ -429,13 +581,17 @@ fn restrict_socket(_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-async fn serve_connection(
-    stream: UnixStream,
+/// Обслужить одно соединение. Не знает, что под ним — сокет unix или канал
+/// Windows: нужен только поток байтов.
+async fn serve_connection<S>(
+    stream: S,
     handler: Arc<dyn AgentHandler>,
     token: String,
-) -> Result<()> {
-    let (read, mut write) = stream.into_split();
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (read, mut write) = tokio::io::split(stream);
     let mut lines = BufReader::new(read).lines();
 
     while let Some(line) = lines.next_line().await? {
@@ -563,6 +719,12 @@ pub struct PlanStep {
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
+    /// Машинный вид причины запрета: окно показывает её на языке интерфейса, а
+    /// `blocked_reason` (по-русски) остаётся запасным текстом.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_arg: Option<String>,
     /// Разница, если шаг — правка файла. Строки «было/стало» человек читает
     /// глазами, а команду записи ему пришлось бы выполнять в уме.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -575,6 +737,8 @@ impl PlanStep {
             kind,
             title: title.into(),
             blocked_reason: None,
+            blocked_code: None,
+            blocked_arg: None,
             diff: None,
         }
     }
@@ -612,10 +776,12 @@ pub fn classify_steps(commands: &[String]) -> Vec<PlanStep> {
             if stopped {
                 return PlanStep::plain(StepKind::Skipped, command);
             }
-            if let Some(reason) = safety::is_forbidden_outright(command) {
+            if let Some(forbidden) = safety::forbidden_detail(command) {
                 stopped = true;
                 return PlanStep {
-                    blocked_reason: Some(reason),
+                    blocked_reason: Some(forbidden.reason),
+                    blocked_code: Some(forbidden.code.to_string()),
+                    blocked_arg: forbidden.arg,
                     ..PlanStep::plain(StepKind::Blocked, command)
                 };
             }
@@ -934,6 +1100,10 @@ mod plan_tests {
         assert_eq!(json["steps"][0]["kind"], "check");
         assert_eq!(json["steps"][1]["kind"], "blocked");
         assert!(json["steps"][1]["blockedReason"].is_string());
+        // Окно переводит причину по коду, а не по русскому тексту.
+        assert_eq!(json["steps"][1]["blockedCode"], "never");
+        assert_eq!(json["steps"][1]["blockedArg"], "mkfs");
+        assert!(json["steps"][0].get("blockedCode").is_none());
         assert!(json["steps"][0].get("blockedReason").is_none());
     }
 

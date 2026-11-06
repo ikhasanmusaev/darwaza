@@ -40,7 +40,7 @@ function makeHandlers(state: { calls: string[]; files: any[] }) {
       failedAttempts: 0,
     }),
 
-    recordings_dir: () => "/home/tester/.local/share/termius-analog/recordings",
+    recordings_dir: () => "/home/tester/.local/share/darwaza/recordings",
     recordings_list: () => state.files,
     recordings_remove: (args: any) => {
       state.files = state.files.filter((f) => f.path !== args.path);

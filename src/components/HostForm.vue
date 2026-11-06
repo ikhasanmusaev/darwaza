@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { useRouter } from "vue-router";
-import { Save, Loader2, KeyRound } from "lucide-vue-next";
+import { Save, Loader2, KeyRound, ChevronDown, ChevronRight } from "lucide-vue-next";
 import { useHostsStore } from "../stores/hosts";
 import { useIdentitiesStore } from "../stores/identities";
 import type { HostInput } from "../api/hosts";
@@ -133,6 +133,9 @@ function goCreateIdentity() {
 
 const agentConfirmOpen = ref(false);
 
+/** Раздел «Для ИИ-помощника» свёрнут, пока человек сам его не откроет. */
+const aiOpen = ref(false);
+
 function onAgentAccessChange(event: Event) {
   const checkbox = event.target as HTMLInputElement;
   if (checkbox.checked) {
@@ -167,11 +170,18 @@ async function onSubmit() {
     error.value = t("hosts.validation.portInvalid");
     return;
   }
-  if (input.value.authMethod === "publickey" && !input.value.identityId) {
+  // Секрет обязателен только при создании. При правке пусто = оставить то,
+  // что сохранено: чтобы сменить группу или название, пароль заново не вводят.
+  if (!isEdit.value && input.value.authMethod === "publickey" && !input.value.identityId) {
     error.value = t("hosts.validation.identityRequired");
     return;
   }
-  if (input.value.authMethod === "password" && !input.value.identityId && !password.value.trim()) {
+  if (
+    !isEdit.value &&
+    input.value.authMethod === "password" &&
+    !input.value.identityId &&
+    !password.value.trim()
+  ) {
     error.value = t("hosts.validation.identityOrPasswordRequired");
     return;
   }
@@ -180,6 +190,10 @@ async function onSubmit() {
   try {
     const submitData: HostInput = {
       ...input.value,
+      // Пробелы по краям не нужны никогда: « 1.1.1.1» ломало соединение.
+      name: input.value.name.trim(),
+      hostname: input.value.hostname.trim(),
+      username: input.value.username.trim(),
       password: password.value || null,
     };
     if (isEdit.value && props.hostId != null) {
@@ -209,6 +223,7 @@ async function onSubmit() {
       <!-- Error banner -->
       <div
         v-if="error"
+        data-testid="host-form-error"
         class="bg-danger-soft border border-danger/40 text-danger-text text-sm rounded px-3 py-2"
       >
         {{ error }}
@@ -222,6 +237,7 @@ async function onSubmit() {
           </label>
           <input
             v-model="input.name"
+            data-testid="host-name-input"
             type="text"
             class="w-full bg-surface-card border border-edge rounded px-3 py-2 text-sm focus:outline-none focus:border-accent"
             :placeholder="t('hosts.form.namePlaceholder')"
@@ -235,6 +251,7 @@ async function onSubmit() {
           </label>
           <input
             v-model="input.hostname"
+            data-testid="host-hostname-input"
             type="text"
             class="w-full bg-surface-card border border-edge rounded px-3 py-2 text-sm focus:outline-none focus:border-accent"
             :placeholder="t('hosts.form.hostnamePlaceholder')"
@@ -262,6 +279,7 @@ async function onSubmit() {
           </label>
           <input
             v-model="input.username"
+            data-testid="host-username-input"
             type="text"
             class="w-full bg-surface-card border border-edge rounded px-3 py-2 text-sm focus:outline-none focus:border-accent"
             :placeholder="t('hosts.form.usernamePlaceholder')"
@@ -319,66 +337,6 @@ async function onSubmit() {
           <p class="mt-1 text-[11px] text-warning-text/90">
             {{ t("hosts.form.forwardAgentWarning") }}
           </p>
-        </div>
-
-        <!-- Доступ агента (#201) -->
-        <div class="sm:col-span-2">
-          <label class="flex items-center gap-2 text-sm text-on-surface cursor-pointer">
-            <input
-              :checked="!!input.agentAccess"
-              type="checkbox"
-              data-testid="host-agent-access"
-              class="accent-accent"
-              @change="onAgentAccessChange"
-            />
-            {{ t("hosts.form.agentAccess") }}
-          </label>
-          <p class="mt-1 text-[11px] text-warning-text/90">
-            {{ t("hosts.form.agentAccessWarning") }}
-          </p>
-
-          <!-- Читающие команды с sudo (#214) -->
-          <div v-if="input.agentAccess" class="mt-3">
-            <label class="block text-xs text-on-surface-muted mb-1">
-              {{ t("hosts.form.agentSudoRead") }}
-            </label>
-            <textarea
-              v-model="input.agentSudoRead"
-              rows="3"
-              spellcheck="false"
-              data-testid="host-agent-sudo"
-              class="w-full bg-surface-input border border-edge rounded px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent"
-              :placeholder="t('hosts.form.agentSudoReadPlaceholder')"
-            />
-            <p class="mt-1 text-[11px] text-warning-text/90">
-              {{ t("hosts.form.agentSudoReadWarning") }}
-            </p>
-          </div>
-
-          <!-- Заметки помощника (#217) -->
-          <div v-if="input.agentNotes" class="mt-3" data-testid="host-agent-notes">
-            <div class="flex items-center justify-between mb-1">
-              <label class="block text-xs text-on-surface-muted">
-                {{ t("hosts.form.agentNotes") }}
-              </label>
-              <button
-                type="button"
-                data-testid="host-agent-notes-clear"
-                class="text-[11px] text-on-surface-faint hover:text-on-surface underline decoration-dotted"
-                @click="input.agentNotes = ''"
-              >
-                {{ t("hosts.form.agentNotesClear") }}
-              </button>
-            </div>
-            <p
-              class="text-xs text-on-surface-muted whitespace-pre-wrap bg-surface border border-edge rounded px-3 py-2"
-            >
-              {{ input.agentNotes }}
-            </p>
-            <p class="mt-1 text-[11px] text-on-surface-faint">
-              {{ t("hosts.form.agentNotesHint") }}
-            </p>
-          </div>
         </div>
 
         <!-- Color -->
@@ -446,7 +404,8 @@ async function onSubmit() {
           v-model="password"
           type="password"
           class="w-full bg-surface-card border border-edge rounded px-3 py-2 text-sm focus:outline-none focus:border-accent"
-          :placeholder="t('hosts.form.passwordPlaceholder')"
+          :placeholder="isEdit ? t('hosts.form.passwordEditPlaceholder') : t('hosts.form.passwordPlaceholder')"
+          data-testid="host-password"
         />
         <p class="text-xs text-on-surface-faint mt-1">
           {{ t("hosts.form.passwordHint") }}
@@ -499,10 +458,96 @@ async function onSubmit() {
         />
       </div>
 
+      <!-- Для ИИ-помощника: всё, что с ним связано, в одном сворачиваемом разделе.
+           Свёрнутый — не сброшенный: значения живут в `input`, раздел лишь прячет их. -->
+      <div class="border border-edge rounded" data-testid="host-ai-section">
+        <button
+          type="button"
+          data-testid="host-ai-toggle"
+          class="w-full flex items-center gap-2 px-3 py-2 text-sm text-on-surface text-left hover:bg-surface-alt"
+          :aria-expanded="aiOpen"
+          @click="aiOpen = !aiOpen"
+        >
+          <component :is="aiOpen ? ChevronDown : ChevronRight" :size="16" class="shrink-0" />
+          <span>{{ t("hosts.form.aiSection") }}</span>
+          <span
+            v-if="input.agentAccess"
+            data-testid="host-ai-badge-access"
+            class="ml-auto text-[11px] text-warning-text"
+          >{{ t("hosts.form.aiSectionEnabled") }}</span>
+          <span
+            v-if="input.agentNotes"
+            data-testid="host-ai-badge-notes"
+            class="text-[11px] text-on-surface-muted"
+            :class="input.agentAccess ? '' : 'ml-auto'"
+          >{{ t("hosts.form.aiSectionNotes") }}</span>
+        </button>
+        <div v-show="aiOpen" class="px-3 pb-3 pt-1" data-testid="host-ai-body">
+          <label class="flex items-center gap-2 text-sm text-on-surface cursor-pointer">
+            <input
+              :checked="!!input.agentAccess"
+              type="checkbox"
+              data-testid="host-agent-access"
+              class="accent-accent"
+              @change="onAgentAccessChange"
+            />
+            {{ t("hosts.form.agentAccess") }}
+          </label>
+          <p class="mt-1 text-[11px] text-warning-text/90">
+            {{ t("hosts.form.agentAccessWarning") }}
+          </p>
+
+          <!-- Читающие команды с sudo (#214) -->
+          <div v-if="input.agentAccess" class="mt-3">
+            <label class="block text-xs text-on-surface-muted mb-1">
+              {{ t("hosts.form.agentSudoRead") }}
+            </label>
+            <textarea
+              v-model="input.agentSudoRead"
+              rows="3"
+              spellcheck="false"
+              data-testid="host-agent-sudo"
+              class="w-full bg-surface-input border border-edge rounded px-3 py-2 text-sm font-mono focus:outline-none focus:border-accent"
+              :placeholder="t('hosts.form.agentSudoReadPlaceholder')"
+            />
+            <p class="mt-1 text-[11px] text-warning-text/90">
+              {{ t("hosts.form.agentSudoReadWarning") }}
+            </p>
+          </div>
+
+          <!-- Заметки помощника (#217) -->
+          <div v-if="input.agentNotes" class="mt-3" data-testid="host-agent-notes">
+            <div class="flex items-center justify-between mb-1">
+              <label class="block text-xs text-on-surface-muted">
+                {{ t("hosts.form.agentNotes") }}
+              </label>
+              <button
+                type="button"
+                data-testid="host-agent-notes-clear"
+                class="text-[11px] text-on-surface-faint hover:text-on-surface underline decoration-dotted"
+                @click="input.agentNotes = ''"
+              >
+                {{ t("hosts.form.agentNotesClear") }}
+              </button>
+            </div>
+            <p
+              class="text-xs text-on-surface-muted whitespace-pre-wrap bg-surface border border-edge rounded px-3 py-2"
+            >
+              {{ input.agentNotes }}
+            </p>
+            <p class="mt-1 text-[11px] text-on-surface-faint">
+              {{ t("hosts.form.agentNotesHint") }}
+            </p>
+          </div>
+        
+        </div>
+      </div>
+
       <!-- Actions -->
       <div class="flex items-center gap-3 pt-2">
         <button
           type="submit"
+          data-testid="host-form-submit"
           class="inline-flex items-center gap-1.5 px-4 py-2 text-sm rounded bg-accent hover:bg-accent-hover active:bg-accent-active text-on-accent disabled:opacity-60 disabled:cursor-not-allowed"
           :disabled="saving"
         >

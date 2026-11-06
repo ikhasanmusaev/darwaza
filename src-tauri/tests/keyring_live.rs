@@ -20,7 +20,7 @@
 
 use std::process::Command;
 
-const SERVICE: &str = "termius-analog";
+const SERVICE: &str = "darwaza";
 
 #[test]
 #[ignore = "нужен работающий Secret Service (KWallet/GNOME Keyring)"]
@@ -85,4 +85,22 @@ fn availability_check_writes_nothing() {
         matches!(probe.get_password(), Err(keyring::Error::NoEntry)),
         "проверка доступности оставила запись в хранилище — она обязана только читать"
     );
+}
+
+/// Запись, сохранённая 0.1.0 под прежним именем службы, находится и
+/// переезжает на новое имя.
+#[test]
+#[ignore = "нужен работающий Secret Service (KWallet/GNOME Keyring)"]
+fn a_secret_under_the_pre_0_1_1_service_name_moves_to_the_new_one() {
+    // Прежнее имя службы нужно, чтобы создать запись «как у 0.1.0».
+    const LEGACY: &str = "termius-analog"; // LEGACY: имя службы 0.1.0
+    let account = "password::999998";
+    let old = keyring::Entry::new(LEGACY, account).expect("запись keyring");
+    old.set_password("старый-секрет").expect("сохранение");
+
+    let got = darwaza_lib::keyring_store::get("password", 999998).expect("чтение");
+    assert_eq!(got.as_deref(), Some("старый-секрет"));
+    assert!(old.get_password().is_err(), "старая запись должна исчезнуть");
+
+    darwaza_lib::keyring_store::delete("password", 999998).expect("уборка");
 }

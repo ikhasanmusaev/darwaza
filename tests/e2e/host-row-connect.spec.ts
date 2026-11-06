@@ -53,4 +53,21 @@ test.describe("подключение по строке хоста", () => {
     await page.keyboard.press("Enter");
     await expect.poll(() => calls.length).toBe(1);
   });
+
+  test("Пробел на сфокусированной строке открывает правку и не подключает", async ({ page }) => {
+    const calls = await setup(page);
+    await page.getByTestId("host-row").first().focus();
+    await page.keyboard.press("Space");
+    // Правка открывается панелью с формой хоста.
+    await expect(page.getByTestId("host-name-input")).toHaveValue("alpha");
+    expect(calls).toHaveLength(0);
+  });
+
+  test("Пробел на кнопке внутри строки не открывает правку", async ({ page }) => {
+    await setup(page);
+    const row = page.getByTestId("host-row").first();
+    await row.getByTestId("host-agent-access-row").focus();
+    await page.keyboard.press("Space");
+    await expect(page.getByTestId("host-name-input")).toHaveCount(0);
+  });
 });

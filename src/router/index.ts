@@ -24,6 +24,11 @@ const routes: RouteRecordRaw[] = [
     component: () => import("../pages/SnippetsListPage.vue"),
   },
   {
+    path: "/sftp",
+    name: "sftp",
+    component: () => import("../pages/SftpPage.vue"),
+  },
+  {
     path: "/forwards",
     name: "forwards",
     component: () => import("../pages/PortForwardsPage.vue"),

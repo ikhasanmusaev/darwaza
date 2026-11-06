@@ -111,6 +111,7 @@ pub async fn recovery_key_save(path: String, key: String) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -119,6 +120,7 @@ mod tests {
 
     const KEY: &str = "7K2P-9QXM-4HVT-8WNB-3RJD-6FZC-5YGM-2AKT";
 
+    #[cfg(unix)] // права файла в стиле unix; на Windows их задаёт профиль пользователя
     #[test]
     fn the_key_file_is_private_from_the_first_byte() {
         let path = scratch("key.txt");

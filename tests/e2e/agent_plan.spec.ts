@@ -195,14 +195,43 @@ test.describe("S25 — подтверждение планов агента", ()
     });
 
     await expect(page.getByTestId("agent-plan-approve")).toBeEnabled();
-    await expect(page.getByTestId("agent-plan-dialog")).toContainText("1 blocked");
-    await expect(page.getByTestId("agent-plan-steps")).toContainText("skipped");
+    await expect(page.getByTestId("agent-plan-dialog")).toContainText("Taqiqlangan: 1");
+    await expect(page.getByTestId("agent-plan-dialog")).toContainText("O'tkazib yuborilgan: 1");
     await expect(page.getByTestId("agent-plan-dialog")).toContainText("Agent o'zini claude-mcp");
     await expect(page.getByTestId("agent-plan-dialog")).toContainText("Jurnalga yozilmoqda");
 
     await page.keyboard.press("Escape");
     await expect.poll(() => state.rejected).toEqual(["plan-blocked"]);
     expect(state.approved).toEqual([]);
+  });
+
+  test("причина запрета и бейджи переводятся по коду, а не показывают русский текст ядра", async ({ page }) => {
+    const state = freshState();
+    await mockTauriInvoke(page, makeHandlers(state));
+    await page.goto("/hosts");
+    await emitTauriEvent(page, "agent://plan", {
+      ...BASE,
+      id: "plan-reason",
+      host: "prod",
+      intent: "x",
+      steps: [
+        { kind: "check", title: "nginx -t" },
+        {
+          kind: "blocked",
+          title: "sed -i s/a/b/ /etc/ssh/authorized_keys",
+          blockedReason: "изменение 'authorized_keys' через агента не выполняется",
+          blockedCode: "protected_path",
+          blockedArg: "authorized_keys",
+        },
+      ],
+    });
+    const steps = page.getByTestId("agent-plan-steps");
+    await expect(steps).toContainText("'authorized_keys'");
+    await expect(steps).toContainText("agent orqali");
+    await expect(steps).not.toContainText("через агента");
+    // Бейджи — на языке интерфейса, а не сырые «check»/«blocked».
+    await expect(steps).toContainText("tekshiruv");
+    await expect(steps).toContainText("taqiqlangan");
   });
 
   test("истёкший план не подтверждается и закрывается через dismissGone", async ({ page }) => {

@@ -320,6 +320,7 @@ async fn proxy_jump_through_intermediate_host() {
 ///
 /// Требует запущенного агента с добавленным тестовым ключом — тест сам его
 /// не поднимает, поэтому при отсутствии `SSH_AUTH_SOCK` осмысленно пропускается.
+#[cfg(unix)] // свой ssh-agent через unix-сокет; на Windows агент — именованный канал
 #[tokio::test]
 #[ignore = "требует sshd на 2222 и ssh-agent с тестовым ключом"]
 async fn agent_auth_against_real_sshd() {
@@ -544,6 +545,7 @@ async fn remote_forward_delivers_incoming_connections() {
 /// канала от сервера и проксирование его на локальный сокет агента. Успех — если
 /// `ssh-add -l` **на сервере** видит наш ключ, то есть агент реально доступен
 /// удалённой стороне.
+#[cfg(unix)] // свой ssh-agent через unix-сокет; на Windows агент — именованный канал
 #[tokio::test]
 #[ignore = "требует sshd на 2222 и ssh-agent с тестовым ключом"]
 async fn agent_forwarding_exposes_agent_to_remote() {
@@ -1034,5 +1036,108 @@ async fn copying_between_servers_moves_the_whole_file() {
             .disconnect(Disconnect::ByApplication, "", "en")
             .await
             .expect("отключение");
+    }
+}
+
+#[tokio::test]
+#[ignore = "требует локальный sshd на 2222 — scripts/live-sshd.sh"]
+async fn folders_travel_whole_in_every_direction() {
+    use darwaza_lib::transfers::tree::{copy_tree, LocalTree, Outcome, RemoteTree};
+    use std::sync::atomic::AtomicBool;
+
+    let a_session = connect().await;
+    let a = Arc::new(open_sftp(&a_session).await);
+    let b_session = connect().await;
+    let b = Arc::new(open_sftp(&b_session).await);
+
+    let pid = std::process::id();
+    let local = std::env::temp_dir().join(format!("darwaza-tree-live-{pid}"));
+    let _ = std::fs::remove_dir_all(&local);
+    std::fs::create_dir_all(local.join("proj/a/b")).unwrap();
+    std::fs::create_dir_all(local.join("proj/empty")).unwrap();
+    // Больше одного куска передачи (32 КиБ) и не-ASCII в имени.
+    let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(local.join("proj/big.bin"), &big).unwrap();
+    std::fs::write(local.join("proj/a/b/файл.txt"), "привет").unwrap();
+
+    let remote_a = format!("/tmp/darwaza-tree-a-{pid}");
+    let remote_b = format!("/tmp/darwaza-tree-b-{pid}");
+    let _ = a.create_dir(remote_a.clone()).await;
+    let _ = b.create_dir(remote_b.clone()).await;
+
+    let no_cancel = AtomicBool::new(false);
+    let mut quiet = |_p: darwaza_lib::transfers::tree::Progress| {};
+
+    // Компьютер → сервер.
+    let up = copy_tree(
+        &LocalTree,
+        &local.join("proj").to_string_lossy(),
+        "proj",
+        true,
+        &RemoteTree(a.clone()),
+        &remote_a,
+        &no_cancel,
+        &mut quiet,
+    )
+    .await
+    .expect("загрузка папки");
+    assert!(matches!(up, Outcome::Done { files: 2, .. }), "{up:?}");
+    assert_eq!(a.read(format!("{remote_a}/proj/big.bin")).await.unwrap(), big);
+    assert!(a.metadata(format!("{remote_a}/proj/empty")).await.unwrap().is_dir());
+
+    // Сервер → сервер, без диска: те же файлы на другой сессии.
+    let across = copy_tree(
+        &RemoteTree(a.clone()),
+        &format!("{remote_a}/proj"),
+        "proj",
+        true,
+        &RemoteTree(b.clone()),
+        &remote_b,
+        &no_cancel,
+        &mut quiet,
+    )
+    .await
+    .expect("копирование между серверами");
+    assert!(matches!(across, Outcome::Done { files: 2, .. }), "{across:?}");
+    assert_eq!(b.read(format!("{remote_b}/proj/big.bin")).await.unwrap(), big);
+    assert_eq!(
+        b.read(format!("{remote_b}/proj/a/b/файл.txt")).await.unwrap(),
+        "привет".as_bytes()
+    );
+
+    // Сервер → компьютер, повтор в ту же папку получает свободное имя.
+    let down_dir = local.join("down");
+    std::fs::create_dir_all(&down_dir).unwrap();
+    for _ in 0..2 {
+        let down = copy_tree(
+            &RemoteTree(b.clone()),
+            &format!("{remote_b}/proj"),
+            "proj",
+            true,
+            &LocalTree,
+            &down_dir.to_string_lossy(),
+            &no_cancel,
+            &mut quiet,
+        )
+        .await
+        .expect("скачивание папки");
+        assert!(matches!(down, Outcome::Done { files: 2, .. }), "{down:?}");
+    }
+    assert_eq!(std::fs::read(down_dir.join("proj/big.bin")).unwrap(), big);
+    assert!(down_dir.join("proj (2)/a/b/файл.txt").exists(), "повтор затёр или потерялся");
+
+    // Уборка.
+    let _ = std::fs::remove_dir_all(&local);
+    for (sftp, root) in [(&a, &remote_a), (&b, &remote_b)] {
+        for f in ["proj/big.bin", "proj/a/b/файл.txt"] {
+            let _ = sftp.remove_file(format!("{root}/{f}")).await;
+        }
+        for d in ["proj/a/b", "proj/a", "proj/empty", "proj"] {
+            let _ = sftp.remove_dir(format!("{root}/{d}")).await;
+        }
+        let _ = sftp.remove_dir(root.clone()).await;
+    }
+    for s in [a_session, b_session] {
+        s.disconnect(Disconnect::ByApplication, "", "en").await.expect("отключение");
     }
 }

@@ -21,4 +21,11 @@ export const localFsApi = {
   home: () => invoke<string>("local_home"),
   parent: (path: string) => invoke<string>("local_parent", { path }),
   list: (path: string) => invoke<LocalEntry[]>("local_list", { path }),
+  /** Создать папку `name` внутри `dir`; возвращает путь новой папки. */
+  mkdir: (dir: string, name: string) => invoke<string>("local_mkdir", { dir, name }),
+  /** Переименовать запись в её же папке; существующую не затирает. */
+  rename: (path: string, newName: string) =>
+    invoke<string>("local_rename", { path, newName }),
+  /** Файл или пустая папка; рекурсивного удаления нет. */
+  remove: (path: string, isDir: boolean) => invoke<void>("local_remove", { path, isDir }),
 };

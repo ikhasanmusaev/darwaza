@@ -1,7 +1,7 @@
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { transfersApi, type TransferProgress } from "../api/transfers";
+import { transfersApi, type TransferProgress, type TreeEndpoint } from "../api/transfers";
 
 /**
  * Очередь передач для панели снизу (#124).
@@ -46,6 +46,16 @@ export const useTransfersStore = defineStore("transfers", () => {
     return transfersApi.upload(sessionId, localPath, remoteDir);
   }
 
+  async function startTree(
+    source: TreeEndpoint,
+    sourcePath: string,
+    isDir: boolean,
+    target: TreeEndpoint,
+    targetDir: string,
+  ): Promise<string> {
+    return transfersApi.tree(source, sourcePath, isDir, target, targetDir);
+  }
+
   async function cancel(id: string): Promise<void> {
     await transfersApi.cancel(id);
   }
@@ -66,6 +76,7 @@ export const useTransfersStore = defineStore("transfers", () => {
     init,
     startDownload,
     startUpload,
+    startTree,
     cancel,
     dismiss,
     dismissFinished,

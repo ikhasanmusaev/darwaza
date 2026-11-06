@@ -121,19 +121,22 @@ impl client::Handler for ClientHandler {
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
         let session_id = self.session_id;
-        let sock = match std::env::var("SSH_AUTH_SOCK") {
-            Ok(v) => v,
-            Err(_) => {
-                warn!(
-                    target: "ssh.agent",
-                    "session {session_id}: сервер запросил агента, но SSH_AUTH_SOCK не задан"
-                );
-                return Ok(());
-            }
+        // Канал уже подтверждён серверу, и молча бросить его нельзя: удалённый
+        // `ssh` или `git` будут ждать ответа агента до тайм-аута. Если агента
+        // у нас нет, канал закрываем сразу — они увидят обрыв и пойдут дальше.
+        let Some(sock) = agent_socket_path() else {
+            warn!(
+                target: "ssh.agent",
+                "session {session_id}: сервер запросил агента, но SSH_AUTH_SOCK не задан"
+            );
+            tokio::spawn(async move {
+                let _ = channel.close().await;
+            });
+            return Ok(());
         };
 
         tokio::spawn(async move {
-            match tokio::net::UnixStream::connect(&sock).await {
+            match open_agent_stream(&sock).await {
                 Ok(mut agent) => {
                     let mut stream = channel.into_stream();
                     if let Err(e) = tokio::io::copy_bidirectional(&mut agent, &mut stream).await {
@@ -142,6 +145,7 @@ impl client::Handler for ClientHandler {
                 }
                 Err(e) => {
                     warn!(target: "ssh.agent", "session {session_id}: не удалось открыть сокет агента: {e}");
+                    let _ = channel.close().await;
                 }
             }
         });
@@ -219,6 +223,16 @@ impl client::Handler for ClientHandler {
     }
 }
 
+/// Хост, как его надо подключать: пробелы по краям адреса и имени
+/// пользователя убраны. Запись могла быть сохранена старой версией или
+/// импортирована с пробелом (« 1.1.1.1» давало `root@ 1.1.1.1`).
+fn trimmed(mut host: Host) -> Host {
+    host.hostname = host.hostname.trim().to_string();
+    host.username = host.username.trim().to_string();
+    host.name = host.name.trim().to_string();
+    host
+}
+
 async fn load_host(pool: &SqlitePool, host_id: i64) -> Result<Host, String> {
     let sql = format!("SELECT {HOST_FIELDS} FROM hosts WHERE id = ?1");
     sqlx::query_as::<_, Host>(&sql)
@@ -226,6 +240,7 @@ async fn load_host(pool: &SqlitePool, host_id: i64) -> Result<Host, String> {
         .fetch_optional(pool)
         .await
         .map_err(map_err)?
+        .map(trimmed)
         .ok_or_else(|| crate::errors::not_found("ssh", "хост", host_id))
 }
 
@@ -395,6 +410,68 @@ async fn build_jump_chain(pool: &SqlitePool, target: Host) -> Result<Vec<Host>, 
     Ok(chain)
 }
 
+/// Канал агента OpenSSH для Windows (служба `ssh-agent`).
+#[cfg(windows)]
+const WINDOWS_AGENT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
+
+/// Где слушает ssh-agent.
+///
+/// На unix — только `SSH_AUTH_SOCK`. На Windows агент OpenSSH слушает
+/// именованный канал, и переменную обычно никто не задаёт; а если её выставил
+/// Git Bash, там unix-путь msys, который нам не открыть, — такой пропускаем.
+fn agent_socket_path() -> Option<String> {
+    let env = std::env::var("SSH_AUTH_SOCK").ok().filter(|v| !v.is_empty());
+    #[cfg(windows)]
+    {
+        Some(
+            env.filter(|v| v.starts_with(r"\\.\pipe\"))
+                .unwrap_or_else(|| WINDOWS_AGENT_PIPE.to_string()),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        env
+    }
+}
+
+#[cfg(unix)]
+type AgentIo = tokio::net::UnixStream;
+#[cfg(windows)]
+type AgentIo = tokio::net::windows::named_pipe::NamedPipeClient;
+
+/// Открывает соединение с агентом: unix-сокет или именованный канал Windows.
+///
+/// Тип конкретный, не `Box<dyn AgentStream>`: с трейт-объектом rustc не может
+/// доказать `Send` для future сессии целиком.
+async fn open_agent_stream(path: &str) -> std::io::Result<AgentIo> {
+    #[cfg(unix)]
+    {
+        tokio::net::UnixStream::connect(path).await
+    }
+    #[cfg(windows)]
+    {
+        tokio::net::windows::named_pipe::ClientOptions::new().open(path)
+    }
+}
+
+/// Отвечает ли агент: можно ли открыть его сокет (канал) прямо сейчас.
+///
+/// «Файл есть» не годится: агент мог завершиться, оставив сокет и переменную.
+/// Проброс такого сокета оставил бы удалённый `ssh` ждать до тайм-аута.
+async fn agent_reachable(path: &str) -> bool {
+    open_agent_stream(path).await.is_ok()
+}
+
+/// Сообщение о недоступном агенте. Без имён переменных и путей: на Linux и
+/// macOS агент ищется через `SSH_AUTH_SOCK`, на Windows — в именованном
+/// канале OpenSSH, и подсказка про одну из схем на другой системе путает.
+fn agent_connect_error(e: &dyn std::fmt::Display) -> String {
+    format!(
+        "не удалось подключиться к ssh-agent: {e}. \
+         Проверьте, что агент ssh вашей системы запущен"
+    )
+}
+
 /// Аутентификация через ssh-agent (#150).
 ///
 /// Приватный ключ агент не отдаёт — он сам подписывает challenge, поэтому
@@ -405,14 +482,13 @@ async fn authenticate_via_agent(
     host: &Host,
     wanted_public_key: Option<&str>,
 ) -> Result<bool, String> {
-    let mut agent = russh::keys::agent::client::AgentClient::connect_env()
+    let sock = agent_socket_path().ok_or_else(|| {
+        "ssh-agent не найден: проверьте, что агент ssh вашей системы запущен".to_string()
+    })?;
+    let stream = open_agent_stream(&sock)
         .await
-        .map_err(|e| {
-            format!(
-                "не удалось подключиться к ssh-agent: {e}. \
-                 Проверьте, что агент запущен и переменная SSH_AUTH_SOCK установлена"
-            )
-        })?;
+        .map_err(|e| agent_connect_error(&e))?;
+    let mut agent = russh::keys::agent::client::AgentClient::connect(stream);
 
     let identities = agent
         .request_identities()
@@ -812,6 +888,27 @@ pub async fn ssh_connect(
     app: AppHandle,
     host_id: i64,
 ) -> Result<ConnectResponse, String> {
+    connect_session(state, app, host_id, false).await
+}
+
+/// Соединение только для файлов (экран SFTP): та же проверка ключа хоста и
+/// вход, что у терминала, но без PTY и оболочки на сервере. Во вкладки не
+/// попадает; закрывается обычным `ssh_disconnect`.
+#[tauri::command]
+pub async fn sftp_connect(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    host_id: i64,
+) -> Result<ConnectResponse, String> {
+    connect_session(state, app, host_id, true).await
+}
+
+async fn connect_session(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    host_id: i64,
+    files_only: bool,
+) -> Result<ConnectResponse, String> {
     let host = load_host(&state.db, host_id).await?;
     let auth_material = resolve_auth(&host, &state.db, &state.master).await?;
     let session_id = Uuid::new_v4();
@@ -819,6 +916,7 @@ pub async fn ssh_connect(
     let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCmd>(64);
     let handle = SessionHandle {
         host_id,
+        files_only,
         status: SessionStatus::Connecting,
         cmd_tx,
     };
@@ -846,6 +944,7 @@ pub async fn ssh_connect(
             host,
             auth_material,
             cmd_rx,
+            files_only,
         )
         .await;
 
@@ -1003,6 +1102,7 @@ async fn run_session(
     host: Host,
     auth_material: AuthMaterial,
     mut cmd_rx: mpsc::Receiver<SessionCmd>,
+    files_only: bool,
 ) -> Result<Option<u32>, String> {
     let SessionEnv {
         app,
@@ -1129,48 +1229,76 @@ async fn run_session(
     // mut: `tcpip_forward` берёт `&mut self`.
     let mut session = target_session.expect("цепочка не может быть пустой");
 
-    emit_status(&app, session_id, SessionStatus::PtyOpening, None);
-    manager
-        .set_status(session_id, SessionStatus::PtyOpening)
-        .await;
+    // Экран SFTP: терминал не нужен, оболочку на сервере не заводим.
+    let mut channel: Option<russh::Channel<client::Msg>> = None;
+    if files_only {
+        emit_status(&app, session_id, SessionStatus::Connected, None);
+        manager
+            .set_status(session_id, SessionStatus::Connected)
+            .await;
+        info!(target: "ssh", "session {session_id}: соединение для файлов готово");
+    } else {
+        emit_status(&app, session_id, SessionStatus::PtyOpening, None);
+        manager
+            .set_status(session_id, SessionStatus::PtyOpening)
+            .await;
 
-    let mut channel = session
-        .channel_open_session()
-        .await
-        .map_err(|e| format!("channel open failed: {e}"))?;
+        let chan = session
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("channel open failed: {e}"))?;
 
-    channel
-        .request_pty(false, "xterm-256color", 80, 24, 0, 0, &[])
-        .await
-        .map_err(|e| format!("request pty failed: {e}"))?;
+        chan
+            .request_pty(false, "xterm-256color", 80, 24, 0, 0, &[])
+            .await
+            .map_err(|e| format!("request pty failed: {e}"))?;
 
-    // Проброс агента запрашивается ДО shell: сервер должен успеть выставить
-    // SSH_AUTH_SOCK в окружение запускаемой оболочки (#150a).
-    if host.forward_agent {
-        match channel.agent_forward(false).await {
-            Ok(()) => info!(target: "ssh.agent", "session {session_id}: запрошен проброс агента"),
-            // Сервер может запрещать проброс (`AllowAgentForwarding no`) — это
-            // не повод не открывать терминал.
-            Err(e) => {
-                warn!(target: "ssh.agent", "session {session_id}: проброс агента отклонён: {e}")
+        // Проброс агента запрашивается ДО shell: сервер должен успеть выставить
+        // SSH_AUTH_SOCK в окружение запускаемой оболочки (#150a).
+        //
+        // Просим проброс, только если у нас есть что пробрасывать. Иначе сервер
+        // выставит `SSH_AUTH_SOCK` на агента, которого нет, и `ssh`/`git` на нём
+        // зависнут в ожидании ответа.
+        let forward_agent = host.forward_agent
+            && match agent_socket_path() {
+                Some(path) => agent_reachable(&path).await,
+                None => false,
+            };
+        if host.forward_agent && !forward_agent {
+            warn!(
+                target: "ssh.agent",
+                "session {session_id}: проброс агента включён, но локального агента нет (SSH_AUTH_SOCK) — не запрашиваю"
+            );
+        }
+        if forward_agent {
+            match chan.agent_forward(false).await {
+                Ok(()) => info!(target: "ssh.agent", "session {session_id}: запрошен проброс агента"),
+                // Сервер может запрещать проброс (`AllowAgentForwarding no`) — это
+                // не повод не открывать терминал.
+                Err(e) => {
+                    warn!(target: "ssh.agent", "session {session_id}: проброс агента отклонён: {e}")
+                }
             }
         }
+
+        chan
+            .request_shell(false)
+            .await
+            .map_err(|e| format!("request shell failed: {e}"))?;
+
+        emit_status(&app, session_id, SessionStatus::Connected, None);
+        manager
+            .set_status(session_id, SessionStatus::Connected)
+            .await;
+        info!(target: "ssh", "session {session_id}: shell ready");
+        channel = Some(chan);
     }
-
-    channel
-        .request_shell(false)
-        .await
-        .map_err(|e| format!("request shell failed: {e}"))?;
-
-    emit_status(&app, session_id, SessionStatus::Connected, None);
-    manager
-        .set_status(session_id, SessionStatus::Connected)
-        .await;
-    info!(target: "ssh", "session {session_id}: shell ready");
 
     // Автозапуск пробросов (#133). Ошибки не роняют сессию: занятый локальный
     // порт — обычная ситуация, а терять из-за него терминал незачем.
-    start_auto_forwards(&forwards, &manager, &db, session_id, host.id).await;
+    if !files_only {
+        start_auto_forwards(&forwards, &manager, &db, session_id, host.id).await;
+    }
 
     let mut exit_code: Option<u32> = None;
     let mut disconnect_requested = false;
@@ -1187,15 +1315,19 @@ async fn run_session(
             maybe_cmd = cmd_rx.recv() => {
                 match maybe_cmd {
                     Some(SessionCmd::Send(bytes)) => {
-                        if let Err(e) = channel.data(&bytes[..]).await {
-                            warn!(target: "ssh", "session {session_id}: write failed: {e}");
+                        if let Some(channel) = channel.as_ref() {
+                            if let Err(e) = channel.data(&bytes[..]).await {
+                                warn!(target: "ssh", "session {session_id}: write failed: {e}");
+                            }
                         }
                     }
                     Some(SessionCmd::Resize { cols, rows }) => {
                         pty_cols = cols;
                         pty_rows = rows;
-                        if let Err(e) = channel.window_change(cols, rows, 0, 0).await {
-                            warn!(target: "ssh", "session {session_id}: resize failed: {e}");
+                        if let Some(channel) = channel.as_ref() {
+                            if let Err(e) = channel.window_change(cols, rows, 0, 0).await {
+                                warn!(target: "ssh", "session {session_id}: resize failed: {e}");
+                            }
                         }
                     }
                     Some(SessionCmd::StartRecording { responder }) => {
@@ -1301,7 +1433,14 @@ async fn run_session(
                 }
             }
 
-            msg = channel.wait() => {
+            // Без терминала канала нет: ветка не срабатывает никогда, а сессия
+            // живёт, пока её не закроют командой или не оборвётся связь.
+            msg = async {
+                match channel.as_mut() {
+                    Some(channel) => channel.wait().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 match msg {
                     Some(ChannelMsg::Data { data }) => {
                         record_chunk(&mut recorder, session_id, &data).await;
@@ -1342,7 +1481,9 @@ async fn run_session(
         manager
             .set_status(session_id, SessionStatus::Disconnecting)
             .await;
-        let _ = channel.eof().await;
+        if let Some(channel) = channel.as_ref() {
+            let _ = channel.eof().await;
+        }
         let _ = session
             .disconnect(russh::Disconnect::ByApplication, "", "en")
             .await;
@@ -1598,6 +1739,13 @@ pub async fn known_hosts_import(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_error_does_not_name_a_unix_only_variable() {
+        let msg = super::agent_connect_error(&"connection refused");
+        assert!(!msg.contains("SSH_AUTH_SOCK"), "{msg}");
+        assert!(msg.contains("connection refused"));
+    }
+
     use super::*;
     use crate::db::models::{Host, Identity};
     use sqlx::sqlite::SqlitePoolOptions;
@@ -1621,6 +1769,22 @@ mod tests {
     /// Сборка при этом была зелёной: список колонок — строка, компилятор её
     /// не читает. Значит проверять должен тест, и проверять на настоящей
     /// схеме, а не на выдуманной.
+    /// Запись с пробелом (сохранена старой версией) подключается без него.
+    #[tokio::test]
+    async fn a_host_saved_with_spaces_is_connected_without_them() {
+        let pool = fresh_db().await;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO hosts (name, hostname, port, username, auth_method, sync_id) \
+             VALUES (' h ', ' 1.1.1.1', 22, 'root ', 'password', 'sync-sp') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("вставка");
+        let host = load_host(&pool, id).await.expect("загрузка");
+        assert_eq!((host.hostname.as_str(), host.username.as_str()), ("1.1.1.1", "root"));
+        assert_eq!(host_address_label(&host), "1.1.1.1:22");
+    }
+
     #[tokio::test]
     async fn host_fields_cover_the_whole_model() {
         let pool = fresh_db().await;
@@ -1642,6 +1806,28 @@ mod tests {
         assert_eq!(host.name, "t");
         // Значение неважно, важно что колонка вообще доехала до структуры.
         assert!(!host.agent_access);
+    }
+
+    /// Проброс агента без агента не запрашивается, а запрошенный канал не
+    /// остаётся висеть: `ssh`/`git` на сервере иначе ждут ответа до тайм-аута.
+    #[tokio::test]
+    async fn a_missing_local_agent_is_not_offered_to_the_server() {
+        assert!(!agent_reachable("/нет/такого/agent.sock").await);
+        #[cfg(unix)]
+        {
+            let path = std::env::temp_dir().join(format!("darwaza-agent-{}.sock", std::process::id()));
+            std::fs::remove_file(&path).ok();
+            // Файл сокета есть, а слушателя нет — агент завершился.
+            let dead = tokio::net::UnixListener::bind(&path).unwrap();
+            drop(dead);
+            assert!(path.exists());
+            assert!(!agent_reachable(path.to_str().unwrap()).await);
+            let alive = tokio::net::UnixListener::bind(path.with_extension("live")).unwrap();
+            assert!(agent_reachable(path.with_extension("live").to_str().unwrap()).await);
+            drop(alive);
+            std::fs::remove_file(&path).ok();
+            std::fs::remove_file(path.with_extension("live")).ok();
+        }
     }
 
     /// То же для идентификаций: там точно так же не хватало `has_totp`.

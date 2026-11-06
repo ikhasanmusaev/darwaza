@@ -112,3 +112,50 @@ pub async fn migrate(
     }
     Ok(moved)
 }
+
+/// Настройка «перенос записей keyring со старого имени выполнен».
+const SWEEP_FLAG: &str = "keyring.legacy_swept";
+
+/// Однократный проход при запуске: перенести пароли и passphrase всех учёток
+/// со старого имени службы в keyring (0.1.0 → 0.1.1).
+///
+/// Перенос при чтении не достаёт учётки без хостов. Флаг ставится только
+/// после полного прохода без ошибок: если keyring недоступен, повторим при
+/// следующем запуске. При включённом мастер-пароле keyring не используется,
+/// проход пропускаем и флаг не ставим.
+pub async fn sweep_legacy_keyring(db: &SqlitePool) {
+    let done: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?1")
+        .bind(SWEEP_FLAG)
+        .fetch_optional(db)
+        .await
+        .unwrap_or(None);
+    if done.is_some() {
+        return;
+    }
+    if MasterKeyring::is_enabled(db).await.unwrap_or(true) {
+        return;
+    }
+    let ids: Vec<i64> = match sqlx::query_scalar("SELECT id FROM identities").fetch_all(db).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(target: "keyring", "перенос записей: не прочитать учётки: {e}");
+            return;
+        }
+    };
+    // libsecret / Credential Manager блокирующие.
+    let result = tokio::task::spawn_blocking(move || keyring_store::sweep_legacy(&ids)).await;
+    match result {
+        Ok(Ok(moved)) => {
+            tracing::info!(target: "keyring", "перенос записей со старого имени: {moved}");
+            if let Err(e) = sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES (?1, '1')")
+                .bind(SWEEP_FLAG)
+                .execute(db)
+                .await
+            {
+                tracing::warn!(target: "keyring", "флаг переноса не записан: {e}");
+            }
+        }
+        Ok(Err(e)) => tracing::warn!(target: "keyring", "перенос записей не завершён, повторим при запуске: {e}"),
+        Err(e) => tracing::warn!(target: "keyring", "перенос записей: задача упала: {e}"),
+    }
+}

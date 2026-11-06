@@ -92,6 +92,39 @@ fn validate_keep_alive(value: i64) -> Result<(), String> {
     Ok(())
 }
 
+/// Обрезать пробелы по краям у адреса, имени пользователя и названия.
+///
+/// Хост, сохранённый как « 1.1.1.1», превращал соединение в `root@ 1.1.1.1`,
+/// и оно не работало, а причину в форме было не увидеть. Пустое после обрезки
+/// и пробел внутри адреса или имени пользователя — ошибка проверки, а не
+/// молчаливое «как есть».
+fn normalize_host_input(data: &mut HostInput) -> Result<(), String> {
+    use crate::errors::{codes, invalid};
+
+    data.name = data.name.trim().to_string();
+    data.hostname = data.hostname.trim().to_string();
+    data.username = data.username.trim().to_string();
+
+    if data.name.is_empty() {
+        return Err(invalid("normalize_host_input", "название пусто", codes::NAME_REQUIRED));
+    }
+    if data.hostname.is_empty() || data.hostname.chars().any(char::is_whitespace) {
+        return Err(invalid(
+            "normalize_host_input",
+            "адрес пуст или содержит пробел",
+            codes::INVALID_HOSTNAME,
+        ));
+    }
+    if data.username.is_empty() || data.username.chars().any(char::is_whitespace) {
+        return Err(invalid(
+            "normalize_host_input",
+            "имя пользователя пусто или содержит пробел",
+            codes::INVALID_USERNAME,
+        ));
+    }
+    Ok(())
+}
+
 fn validate_host_input(data: &HostInput) -> Result<(), String> {
     validate_auth_method(&data.auth_method)?;
     validate_port(data.port)?;
@@ -150,6 +183,7 @@ pub async fn hosts_get(state: State<'_, AppState>, id: i64) -> Result<Host, Stri
 
 #[tauri::command]
 pub async fn hosts_create(state: State<'_, AppState>, mut data: HostInput) -> Result<Host, String> {
+    normalize_host_input(&mut data)?;
     validate_host_input(&data)?;
     resolve_inline_password(&state.db, &state.master, &mut data).await?;
     let keep_alive = data.keep_alive_interval.unwrap_or(30);
@@ -210,6 +244,7 @@ pub async fn hosts_update(
     id: i64,
     mut data: HostInput,
 ) -> Result<Host, String> {
+    normalize_host_input(&mut data)?;
     validate_host_input(&data)?;
     resolve_inline_password(&state.db, &state.master, &mut data).await?;
 
@@ -324,6 +359,58 @@ mod tests {
             .fetch_one(pool)
             .await
             .expect("обновление")
+    }
+
+    fn input(name: &str, hostname: &str, username: &str) -> HostInput {
+        serde_json::from_value(serde_json::json!({
+            "name": name, "hostname": hostname, "port": 22,
+            "username": username, "authMethod": "password",
+        }))
+        .expect("HostInput")
+    }
+
+    /// Пробелы по краям адреса, имени пользователя и названия убираются;
+    /// пустое и пробел внутри — ошибка с кодом, а не «как есть».
+    #[test]
+    fn spaces_around_the_address_are_trimmed_and_bad_values_refused() {
+        let mut ok = input("  prod  ", " 1.1.1.1 ", " root\t");
+        normalize_host_input(&mut ok).expect("обрезка");
+        assert_eq!((ok.name.as_str(), ok.hostname.as_str(), ok.username.as_str()), ("prod", "1.1.1.1", "root"));
+
+        use crate::errors::codes;
+        let mut a = input("n", "   ", "root");
+        assert_eq!(normalize_host_input(&mut a).unwrap_err(), codes::INVALID_HOSTNAME);
+        let mut b = input("n", "1.1. 1.1", "root");
+        assert_eq!(normalize_host_input(&mut b).unwrap_err(), codes::INVALID_HOSTNAME);
+        let mut c = input("n", "1.1.1.1", " ");
+        assert_eq!(normalize_host_input(&mut c).unwrap_err(), codes::INVALID_USERNAME);
+        let mut d = input("n", "1.1.1.1", "ro ot");
+        assert_eq!(normalize_host_input(&mut d).unwrap_err(), codes::INVALID_USERNAME);
+        let mut e = input("  ", "1.1.1.1", "root");
+        assert_eq!(normalize_host_input(&mut e).unwrap_err(), codes::NAME_REQUIRED);
+    }
+
+    /// Уже сохранённая запись с пробелами чистится миграцией.
+    #[tokio::test]
+    async fn the_trim_migration_cleans_existing_rows() {
+        let pool = fresh_db().await;
+        sqlx::query(
+            "INSERT INTO hosts (name, hostname, port, username, auth_method, sync_id) \
+             VALUES (' old ', ' 1.1.1.1', 22, 'root ', 'password', 'sync-trim')",
+        )
+        .execute(&pool)
+        .await
+        .expect("вставка");
+        sqlx::query(include_str!("../../migrations/20261104000001_trim_host_fields.sql"))
+            .execute(&pool)
+            .await
+            .expect("миграция");
+        let (n, h, u): (String, String, String) =
+            sqlx::query_as("SELECT name, hostname, username FROM hosts")
+                .fetch_one(&pool)
+                .await
+                .expect("чтение");
+        assert_eq!((n.as_str(), h.as_str(), u.as_str()), ("old", "1.1.1.1", "root"));
     }
 
     /// Клиент, не передавший `icon`, не стирает значок; пустая строка стирает.

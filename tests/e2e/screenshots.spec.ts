@@ -47,16 +47,6 @@ const Y = "\u001b[33m";
 const B = "\u001b[1;34m";
 const R = "\u001b[0m";
 
-/** Причина запрета — на языке страницы (в продукте её отдаёт ядро). */
-const BLOCKED_REASON: Record<string, string> = {
-  uz: "agent orqali '/etc/ssh/sshd_config' o'zgartirilmaydi: xato bu yerda kirish imkoniyatini yo'qotadi",
-  ru: "изменение '/etc/ssh/sshd_config' через агента не выполняется: ошибка здесь лишает доступа и возможности исправить",
-  en: "changing '/etc/ssh/sshd_config' through the agent is not allowed: a mistake here locks you out with no way to fix it",
-  kk: "'/etc/ssh/sshd_config' файлын агент арқылы өзгертуге болмайды: қателік кіру мүмкіндігін жояды",
-  ky: "'/etc/ssh/sshd_config' файлын агент аркылуу өзгөртүүгө болбойт: ката кирүү мүмкүнчүлүгүн жок кылат",
-  tr: "'/etc/ssh/sshd_config' dosyasını ajan üzerinden değiştirmek yasak: burada yapılan hata erişimi kaybettirir",
-};
-
 const THEMES = ["dark", "light"] as const;
 
 async function useLocale(page: any, locale: string) {
@@ -274,8 +264,10 @@ for (const locale of LOCALES) {
           { kind: "service", title: "systemctl reload nginx" },
           {
             kind: "blocked",
-            title: "sed -i 's/^#Port 22/Port 2222/' /etc/ssh/sshd_config",
-            blockedReason: BLOCKED_REASON[locale],
+            title: "sed -i '/deploy-old/d' /home/deploy/.ssh/authorized_keys",
+            blockedReason: "изменение 'authorized_keys' через агента не выполняется",
+            blockedCode: "protected_path",
+            blockedArg: "authorized_keys",
           },
           { kind: "skipped", title: "systemctl restart ssh" },
         ],

@@ -30,6 +30,17 @@ pub const BACKUP_SUFFIX: &str = ".darwaza-bak";
 /// Суффикс недокачанного файла на компьютере.
 const PART_SUFFIX: &str = ".darwaza-part";
 
+/// `~\путь` — только на Windows: там обратная косая черта разделяет каталоги.
+/// На unix это обычный символ имени файла, и раскрывать её значило бы менять
+/// смысл пути.
+fn tilde_backslash(raw: &str) -> Option<&str> {
+    if cfg!(windows) {
+        raw.strip_prefix("~\\")
+    } else {
+        None
+    }
+}
+
 /// Разобрать локальный путь из запроса агента.
 ///
 /// Требуется **абсолютный** путь (или начинающийся с `~`). Относительный
@@ -48,7 +59,7 @@ pub fn local_path(raw: &str, home: Option<&Path>) -> Result<PathBuf, String> {
     let path = if raw == "~" {
         home.ok_or("не удалось определить домашний каталог")?
             .to_path_buf()
-    } else if let Some(rest) = raw.strip_prefix("~/") {
+    } else if let Some(rest) = raw.strip_prefix("~/").or_else(|| tilde_backslash(raw)) {
         home.ok_or("не удалось определить домашний каталог")?
             .join(rest)
     } else {
@@ -352,15 +363,27 @@ where
 mod tests {
     use super::*;
 
+    /// Домашний каталог подставной, но абсолютный на той системе, где идёт тест:
+    /// `/home/someone` на Windows не абсолютен, и проверка пути отвергала бы его.
     fn home() -> PathBuf {
-        PathBuf::from("/home/someone")
+        if cfg!(windows) {
+            PathBuf::from(r"C:\Users\someone")
+        } else {
+            PathBuf::from("/home/someone")
+        }
     }
 
     #[test]
     fn a_tilde_path_is_expanded_to_home() {
         assert_eq!(
             local_path("~/logs/app.log", Some(&home())).unwrap(),
-            PathBuf::from("/home/someone/logs/app.log")
+            home().join("logs").join("app.log")
+        );
+        // На Windows `~\` — такая же запись домашнего каталога, как `~/`.
+        #[cfg(windows)]
+        assert_eq!(
+            local_path(r"~\logs\app.log", Some(&home())).unwrap(),
+            home().join(r"logs\app.log")
         );
         assert_eq!(local_path("~", Some(&home())).unwrap(), home());
     }

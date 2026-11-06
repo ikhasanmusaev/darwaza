@@ -159,6 +159,9 @@ export const useSessionsStore = defineStore("sessions", () => {
    * досадно, но мешать работе с серверами он не должен.
    */
   function rememberOpenTabs() {
+    // Пока восстановление выключено, список не перезаписываем: иначе первый
+    // же запуск без вкладок стёр бы сохранённое.
+    if (useSettingsStore().get("session.restore_tabs") !== "true") return;
     const ids = sessions.value.map((s) => s.hostId);
     void useSettingsStore()
       .set(OPEN_TABS_KEY, JSON.stringify(ids))
@@ -263,7 +266,9 @@ export const useSessionsStore = defineStore("sessions", () => {
 
     const settings = useSettingsStore();
     await settings.ensureLoaded();
-    if (settings.get("session.restore_tabs") === "false") return;
+    // По умолчанию выключено (2026-11-04): чистый запуск без вкладок. Сохранённый
+    // список при этом не трогаем — включат настройку, и он снова пригодится.
+    if (settings.get("session.restore_tabs") !== "true") return;
 
     let ids: unknown;
     try {

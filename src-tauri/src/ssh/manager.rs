@@ -142,6 +142,9 @@ impl SshManager {
             .read()
             .await
             .iter()
+            // Соединения экрана SFTP — не вкладки: после перезагрузки окна
+            // восстанавливать их терминалом нельзя.
+            .filter(|(_, h)| !h.files_only)
             .map(|(id, h)| SessionSnapshot {
                 session_id: *id,
                 host_id: h.host_id,

@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { useI18n } from "vue-i18n";
-import { X, Upload, Download, Check, AlertTriangle } from "lucide-vue-next";
+import { X, Upload, Download, Copy, Check, AlertTriangle } from "lucide-vue-next";
 import { useTransfersStore } from "../stores/transfers";
 import type { TransferProgress } from "../api/transfers";
+import { errorText } from "../lib/errors";
 
 /**
  * Панель передач снизу окна (#124).
@@ -30,6 +31,13 @@ function sizeLabel(item: TransferProgress): string {
   return item.total
     ? `${formatBytes(item.transferred)} / ${formatBytes(item.total)}`
     : formatBytes(item.transferred);
+}
+
+/** Строка ошибки: код переводится, перед ней — файл, на котором остановились. */
+function errorLine(item: TransferProgress): string {
+  const raw = item.error ?? "";
+  const text = raw.startsWith("errors.") ? errorText(raw) : raw;
+  return item.currentPath ? `${item.currentPath}: ${text}` : text;
 }
 
 const hasFinished = computed(() => store.items.some((i) => i.status !== "RUNNING"));
@@ -71,7 +79,7 @@ async function onCancel(item: TransferProgress) {
         data-testid="transfer-row"
       >
         <component
-          :is="item.kind === 'upload' ? Upload : Download"
+          :is="item.kind === 'upload' ? Upload : item.kind === 'copy' ? Copy : Download"
           :size="13"
           class="shrink-0 text-on-surface-faint"
         />
@@ -108,8 +116,20 @@ async function onCancel(item: TransferProgress) {
               :style="percent(item) !== null ? { width: `${percent(item)}%` } : undefined"
             />
           </div>
-          <p v-if="item.error" class="text-[11px] text-danger-text truncate mt-0.5">
-            {{ item.error }}
+          <p
+            v-if="item.error"
+            class="text-[11px] text-danger-text truncate mt-0.5"
+            data-testid="transfer-error"
+            :title="errorLine(item)"
+          >
+            {{ errorLine(item) }}
+          </p>
+          <p
+            v-else-if="item.status === 'RUNNING' && item.currentPath"
+            class="text-[11px] text-on-surface-faint truncate mt-0.5"
+            data-testid="transfer-current"
+          >
+            {{ item.currentPath }}
           </p>
         </div>
 

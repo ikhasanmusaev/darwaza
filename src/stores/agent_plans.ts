@@ -19,6 +19,10 @@ export interface PlanStep {
   title: string;
   /** Только у `blocked`. */
   blockedReason?: string;
+  /** Машинный вид причины запрета: по нему окно подбирает перевод. */
+  blockedCode?: "protected_path" | "never" | "device_write" | "delete_root";
+  /** Путь (`protected_path`) или имя программы (`never`). */
+  blockedArg?: string;
   /** Только у `edit`. */
   diff?: DiffLine[];
 }

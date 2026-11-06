@@ -110,3 +110,105 @@ pub async fn local_list(path: String) -> Result<Vec<LocalEntry>, String> {
 
     Ok(entries)
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Правки локальной стороны экрана SFTP
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Проверить имя новой записи: одно имя, не путь. `a/b` и `..` вывели бы запись
+/// за пределы открытой папки, и человек не увидел бы, где она оказалась.
+fn plain_name(name: &str) -> Result<&str, String> {
+    let name = name.trim();
+    let bad = name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0');
+    if bad {
+        return Err("имя не может быть пустым и содержать разделители пути".to_string());
+    }
+    Ok(name)
+}
+
+/// Создать папку `name` внутри `dir`.
+#[tauri::command]
+pub async fn local_mkdir(dir: String, name: String) -> Result<String, String> {
+    let path = Path::new(&dir).join(plain_name(&name)?);
+    tokio::fs::create_dir(&path).await.map_err(map_err)?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Переименовать запись внутри её же папки. Существующую запись не затирает.
+#[tauri::command]
+pub async fn local_rename(path: String, new_name: String) -> Result<String, String> {
+    let from = PathBuf::from(&path);
+    let parent = from
+        .parent()
+        .ok_or_else(|| "у корня нет имени".to_string())?;
+    let to = parent.join(plain_name(&new_name)?);
+    // `rename` на unix молча затирает существующий файл: проверяем сами.
+    if tokio::fs::symlink_metadata(&to).await.is_ok() {
+        return Err("запись с таким именем уже есть".to_string());
+    }
+    tokio::fs::rename(&from, &to).await.map_err(map_err)?;
+    Ok(to.to_string_lossy().to_string())
+}
+
+/// Удалить файл или **пустую** папку. Рекурсивного удаления нет намеренно, как
+/// и на сервере: ошибка здесь стоит чужих данных.
+#[tauri::command]
+pub async fn local_remove(path: String, is_dir: bool) -> Result<(), String> {
+    if is_dir {
+        tokio::fs::remove_dir(&path).await.map_err(map_err)
+    } else {
+        tokio::fs::remove_file(&path).await.map_err(map_err)
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("darwaza-localfs-{}-{name}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_new_name_cannot_be_a_path() {
+        for bad in ["", "  ", ".", "..", "a/b", "../x", "a\\b"] {
+            assert!(plain_name(bad).is_err(), "{bad:?} должно быть отвергнуто");
+        }
+        assert_eq!(plain_name(" новая папка ").unwrap(), "новая папка");
+    }
+
+    #[tokio::test]
+    async fn rename_never_overwrites_and_remove_never_recurses() {
+        let dir = scratch("ops");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+
+        // Занятое имя — отказ, оба файла целы.
+        assert!(local_rename(a.display().to_string(), "b.txt".into()).await.is_err());
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "b");
+
+        let renamed = local_rename(a.display().to_string(), "c.txt".into()).await.unwrap();
+        assert!(Path::new(&renamed).exists() && !a.exists());
+
+        // Папка с содержимым не удаляется.
+        let sub = local_mkdir(dir.display().to_string(), "sub".into()).await.unwrap();
+        std::fs::write(Path::new(&sub).join("x"), "x").unwrap();
+        assert!(local_remove(sub.clone(), true).await.is_err());
+        assert!(Path::new(&sub).join("x").exists());
+
+        std::fs::remove_file(Path::new(&sub).join("x")).unwrap();
+        local_remove(sub, true).await.unwrap();
+        local_remove(b.display().to_string(), false).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

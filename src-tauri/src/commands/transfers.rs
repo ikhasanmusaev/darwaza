@@ -112,6 +112,7 @@ fn emit(
         status,
         error,
         local_path,
+        current_path: None,
     };
     if let Err(e) = app.emit(TRANSFER_EVENT, &payload) {
         warn!(target: "transfers", "не удалось отправить прогресс: {e}");
@@ -572,4 +573,150 @@ pub async fn transfer_cancel(state: State<'_, AppState>, id: Uuid) -> Result<boo
 #[allow(dead_code)]
 fn _assert_manager_in_scope(app: &AppHandle) -> bool {
     app.webview_windows().is_empty()
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Папки целиком и между серверами (экран SFTP)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Одна сторона передачи, как её называет окно.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Endpoint {
+    Local,
+    #[serde(rename_all = "camelCase")]
+    Remote { session_id: Uuid },
+}
+
+async fn tree_side(
+    state: &AppState,
+    endpoint: &Endpoint,
+) -> Result<Arc<dyn crate::transfers::tree::TreeFs>, String> {
+    use crate::transfers::tree::{LocalTree, RemoteTree};
+    Ok(match endpoint {
+        Endpoint::Local => Arc::new(LocalTree),
+        Endpoint::Remote { session_id } => {
+            Arc::new(RemoteTree(super::sftp::sftp_for(state, *session_id).await?))
+        }
+    })
+}
+
+/// Передать файл или папку целиком: компьютер ↔ сервер и сервер → сервер.
+///
+/// Возвращает id сразу; ход — событиями `transfer:progress` (по общему размеру
+/// дерева), отмена — `transfer_cancel`. Подробности правил — `transfers::tree`.
+#[tauri::command]
+pub async fn transfer_tree(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    source: Endpoint,
+    source_path: String,
+    is_dir: bool,
+    target: Endpoint,
+    target_dir: String,
+) -> Result<Uuid, String> {
+    use crate::transfers::tree::{copy_tree, Outcome};
+
+    let kind = match (&source, &target) {
+        (Endpoint::Local, Endpoint::Remote { .. }) => TransferKind::Upload,
+        (Endpoint::Remote { .. }, Endpoint::Local) => TransferKind::Download,
+        (Endpoint::Remote { .. }, Endpoint::Remote { .. }) => TransferKind::Copy,
+        (Endpoint::Local, Endpoint::Local) => {
+            return Err(crate::errors::invalid(
+                "transfers",
+                "копирование внутри компьютера не здесь",
+                crate::errors::codes::UNEXPECTED,
+            ))
+        }
+    };
+    let src = tree_side(&state, &source).await?;
+    let dst = tree_side(&state, &target).await?;
+
+    // Имя берём по правилам источника: путь сервера всегда через `/`.
+    let name = match &source {
+        Endpoint::Local => file_name_of(&source_path),
+        Endpoint::Remote { .. } => source_path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(&source_path)
+            .to_string(),
+    };
+    if name.is_empty() {
+        return Err("не удалось определить имя".to_string());
+    }
+
+    let id = Uuid::new_v4();
+    let cancel = state.transfers.register(id).await;
+    let manager = state.transfers.clone();
+    let shown = if is_dir { format!("{name}/") } else { name.clone() };
+
+    tokio::spawn(async move {
+        emit(&app, id, kind, &shown, 0, None, TransferStatus::Running, None, None);
+        let mut last = Instant::now();
+        let progress_app = app.clone();
+        let progress_name = shown.clone();
+        let mut on_progress = move |p: crate::transfers::tree::Progress| {
+            if should_emit(last.elapsed().as_millis(), false) {
+                last = Instant::now();
+                let payload = TransferProgress {
+                    id,
+                    kind,
+                    name: progress_name.clone(),
+                    transferred: p.transferred,
+                    total: p.total,
+                    status: TransferStatus::Running,
+                    error: None,
+                    local_path: None,
+                    current_path: Some(p.current),
+                };
+                let _ = progress_app.emit(TRANSFER_EVENT, &payload);
+            }
+        };
+
+        let result = copy_tree(
+            src.as_ref(),
+            &source_path,
+            &name,
+            is_dir,
+            dst.as_ref(),
+            &target_dir,
+            &cancel,
+            &mut on_progress,
+        )
+        .await;
+        manager.finish(id).await;
+
+        match result {
+            Ok(Outcome::Done { files, bytes, skipped, dest }) => {
+                info!(target: "transfers", "передано {files} файл(ов), {bytes} байт, пропущено ссылок и особых файлов: {skipped}");
+                let local = matches!(target, Endpoint::Local).then_some(dest);
+                emit(&app, id, kind, &shown, bytes, Some(bytes), TransferStatus::Done, None, local);
+            }
+            Ok(Outcome::Cancelled { files }) => {
+                info!(target: "transfers", "передача отменена, готовых файлов: {files}");
+                emit(&app, id, kind, &shown, 0, None, TransferStatus::Cancelled, None, None);
+            }
+            Err(e) => {
+                // Причина — в журнал; наружу идёт код и путь файла, на котором
+                // остановились (#177).
+                let code = crate::errors::opaque("transfers", format!("{}: {}", e.path, e.message));
+                warn!(target: "transfers", "передача остановилась на {}: {}", e.path, e.message);
+                let payload = TransferProgress {
+                    id,
+                    kind,
+                    name: shown.clone(),
+                    transferred: 0,
+                    total: None,
+                    status: TransferStatus::Failed,
+                    error: Some(code),
+                    local_path: None,
+                    current_path: Some(e.path),
+                };
+                let _ = app.emit(TRANSFER_EVENT, &payload);
+            }
+        }
+    });
+
+    Ok(id)
 }

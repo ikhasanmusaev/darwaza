@@ -201,6 +201,14 @@ function onRowEnter(id: number, e: KeyboardEvent) {
   if (e.target !== e.currentTarget) return;
   connectHost(id);
 }
+/** Пробел на сфокусированной строке открывает правку (карандаш). */
+function onRowSpace(id: number, e: KeyboardEvent) {
+  // Пробел на вложенной кнопке или флажке — их собственное нажатие.
+  if (e.target !== e.currentTarget) return;
+  // Без этого пробел ещё и прокручивает страницу.
+  e.preventDefault();
+  editHost(id);
+}
 </script>
 
 <template>
@@ -361,6 +369,7 @@ function onRowEnter(id: number, e: KeyboardEvent) {
               class="h-14 border-b border-edge-subtle hover:bg-surface-alt focus:bg-surface-alt focus:outline-none focus-visible:ring-1 focus-visible:ring-accent cursor-pointer"
               @dblclick="onRowDblClick(h.id, $event)"
               @keydown.enter="onRowEnter(h.id, $event)"
+              @keydown.space="onRowSpace(h.id, $event)"
             >
               <td class="px-3 py-3">
                 <div class="flex items-center gap-3 min-w-0">

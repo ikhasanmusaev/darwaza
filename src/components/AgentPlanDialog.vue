@@ -46,6 +46,42 @@ watch(
   { immediate: true },
 );
 
+/** Программа из таблицы запретов ядра → ключ перевода «что именно». */
+const NEVER_WHAT: Record<string, string> = {
+  mkfs: "disk_format",
+  fdisk: "partition_table",
+  parted: "partition_table",
+  shutdown: "power_off",
+  poweroff: "power_off",
+  reboot: "reboot",
+  halt: "halt",
+  init: "runlevel",
+  visudo: "sudo_rules",
+};
+
+/**
+ * Причина запрета на языке интерфейса. Ядро присылает код и аргумент, а
+ * русский текст оставляет запасным — для кода, которого здесь ещё нет.
+ */
+function blockedText(step: PendingPlan["steps"][number]): string {
+  const arg = step.blockedArg ?? "";
+  switch (step.blockedCode) {
+    case "protected_path":
+      return t("agentPlan.blockedWhy.protected_path", { path: arg });
+    case "never": {
+      const what = NEVER_WHAT[arg];
+      return what
+        ? t("agentPlan.blockedWhy.never", { what: t(`agentPlan.blockedWhat.${what}`) })
+        : (step.blockedReason ?? "");
+    }
+    case "device_write":
+    case "delete_root":
+      return t(`agentPlan.blockedWhy.${step.blockedCode}`);
+    default:
+      return step.blockedReason ?? "";
+  }
+}
+
 function nothingWillRun(plan: PendingPlan) {
   return plan.steps.every((step) => step.kind === "blocked" || step.kind === "skipped");
 }
@@ -104,8 +140,8 @@ function rejectCurrent() {
         <p class="mt-1 font-mono text-mono text-on-surface-muted">
           {{ plan.hostUser }}@{{ plan.hostAddress }}
           · {{ t("agentPlan.steps", { count: plan.steps.length }) }}
-          · {{ plan.steps.filter((step) => step.kind === "blocked").length }} blocked
-          · {{ plan.steps.filter((step) => step.kind === "skipped").length }} skipped
+          · {{ t("agentPlan.blockedCount", { count: plan.steps.filter((step) => step.kind === "blocked").length }) }}
+          · {{ t("agentPlan.skippedCount", { count: plan.steps.filter((step) => step.kind === "skipped").length }) }}
         </p>
 
         <AlertDialogDescription
@@ -165,11 +201,11 @@ function rejectCurrent() {
                           : 'border-edge text-on-surface-muted'
                     "
                   >
-                    {{ step.kind }}
+                    {{ t(`agentPlan.kind.${step.kind}`) }}
                   </span>
                 </div>
                 <p v-if="step.blockedReason" class="mt-1 text-xs text-danger-text">
-                  {{ step.blockedReason }}
+                  {{ blockedText(step) }}
                 </p>
                 <p v-if="step.kind === 'skipped'" class="mt-1 text-xs text-on-surface-muted">
                   {{ t("agentPlan.skippedReason") }}

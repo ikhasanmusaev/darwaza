@@ -1031,7 +1031,7 @@ dependencies = [
 
 [[package]]
 name = "darwaza"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm 0.11.0",
  "anyhow",
@@ -1041,6 +1041,7 @@ dependencies = [
  "chrono",
  "directories",
  "getrandom 0.4.3",
+ "gtk",
  "hmac",
  "keyring",
  "libc",
@@ -1066,6 +1067,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-normalization",
  "uuid",
+ "windows-sys 0.61.2",
  "zbus",
  "zeroize",
 ]

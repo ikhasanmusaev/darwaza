@@ -18,7 +18,7 @@ function makeHandlers(state: { enabled: boolean; reports: any[]; toggles: boolea
     }),
 
     crash_reports_enabled: () => state.enabled,
-    crash_reports_dir: () => "/home/tester/.local/state/termius-analog/crashes",
+    crash_reports_dir: () => "/home/tester/.local/state/darwaza/crashes",
     crash_reports_list: () => state.reports,
     crash_reports_set_enabled: (args: any) => {
       state.enabled = args.enabled;

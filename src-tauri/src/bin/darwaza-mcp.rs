@@ -18,6 +18,11 @@ use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+// Проверка владельца канала и прав — общий с приложением файл: две копии
+// расходятся молча. Библиотеку приложения целиком посредник по-прежнему не тянет.
+#[cfg(windows)]
+#[path = "../winsec.rs"]
+mod winsec;
 
 /// Как назвался агент при `initialize`. Приложение показывает это рядом с
 /// планом; проверить имя нечем, так что это подпись, а не удостоверение.
@@ -599,46 +604,102 @@ fn ask_app(method: &str, params: Value) -> Result<Value, String> {
         .trim()
         .to_string();
 
-    let socket = socket_path()?;
+    let request = json!({
+        "token": token,
+        "method": method,
+        "params": params,
+        "client": CLIENT.get(),
+        "session": session_id(),
+    });
+    let mut line = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+    line.push(b'\n');
 
-    // На Windows канала пока нет: в приложении он тоже отключён (#160).
-    // Посредник при этом собирается и запускается — иначе сборка под Windows
-    // падала бы целиком из-за возможности, которой там нет.
-    #[cfg(not(unix))]
-    {
-        let _ = (&token, &socket);
-        return Err("доступ агента пока работает только на Linux и macOS".to_string());
-    }
+    // Это самая частая причина отказа, и объяснить её надо человеческим
+    // языком: агент покажет текст пользователю дословно.
+    let not_running = || "приложение Darwaza не запущено: откройте его и повторите".to_string();
+    let no_answer =
+        || "приложение не ответило вовремя: подтвердите план в окне Darwaza".to_string();
 
     #[cfg(unix)]
     {
-        let mut stream = UnixStream::connect(&socket).map_err(|_| {
-            // Это самая частая причина отказа, и объяснить её надо человеческим
-            // языком: агент покажет текст пользователю дословно.
-            "приложение Darwaza не запущено: откройте его и повторите".to_string()
-        })?;
-
+        let socket = socket_path()?;
+        let mut stream = UnixStream::connect(&socket).map_err(|_| not_running())?;
         let _ = stream.set_read_timeout(Some(reply_timeout(method)));
-
-        let request = json!({
-            "token": token,
-            "method": method,
-            "params": params,
-            "client": CLIENT.get(),
-            "session": session_id(),
-        });
-        let mut line = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
-        line.push(b'\n');
         stream.write_all(&line).map_err(|e| e.to_string())?;
         stream.flush().map_err(|e| e.to_string())?;
 
         let mut reader = std::io::BufReader::new(stream);
         let mut answer = String::new();
-        reader.read_line(&mut answer).map_err(|_| {
-            "приложение не ответило вовремя: подтвердите план в окне Darwaza".to_string()
-        })?;
+        reader.read_line(&mut answer).map_err(|_| no_answer())?;
         serde_json::from_str(&answer).map_err(|e| format!("ответ не разбирается: {e}"))
     }
+
+    #[cfg(windows)]
+    {
+        let pipe = pipe_name(&token);
+        let file = open_pipe(&pipe).map_err(|_| not_running())?;
+        // Имя канала видят все пользователи машины, и занять его раньше
+        // приложения может любой. Токен отправляем, только убедившись, что канал
+        // создан процессом ТЕКУЩЕГО пользователя. Не удалось проверить — тоже отказ.
+        match winsec::server_is_current_user(&file) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err("канал агента создан не вами: токен не отправлен. Закройте чужой процесс или перезапустите Darwaza".to_string())
+            }
+            Err(e) => return Err(format!("не удалось проверить владельца канала агента ({e}): токен не отправлен")),
+        }
+
+        // У синхронного чтения из канала нет тайм-аута, поэтому обмен идёт в
+        // отдельном потоке, а здесь ждём ответ с пределом. Опоздавший поток
+        // доживёт до закрытия канала приложением — это редкий случай.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut file = file;
+            let result = file
+                .write_all(&line)
+                .and_then(|_| file.flush())
+                .and_then(|_| {
+                    let mut answer = String::new();
+                    std::io::BufReader::new(file).read_line(&mut answer)?;
+                    Ok(answer)
+                });
+            let _ = tx.send(result);
+        });
+        let answer = rx
+            .recv_timeout(reply_timeout(method))
+            .map_err(|_| no_answer())?
+            .map_err(|_| no_answer())?;
+        serde_json::from_str(&answer).map_err(|e| format!("ответ не разбирается: {e}"))
+    }
+}
+
+/// Открыть канал приложения. Если все экземпляры заняты другими клиентами
+/// (`ERROR_PIPE_BUSY`, 231), подождать и повторить — приложение поднимает
+/// следующий экземпляр сразу, так что ждать приходится доли секунды.
+#[cfg(windows)]
+fn open_pipe(name: &str) -> std::io::Result<std::fs::File> {
+    let mut attempts = 0;
+    loop {
+        match std::fs::OpenOptions::new().read(true).write(true).open(name) {
+            Err(e) if e.raw_os_error() == Some(231) && attempts < 50 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Имя канала на Windows. Повторяет `agent::pipe_name` приложения — по той же
+/// причине, что и пути ниже; расхождение ловит тест с общим значением.
+/// Имя выводится из токена: постоянное имя можно было бы занять раньше
+/// приложения и получить токен от посредника.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn pipe_name(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("darwaza-agent-pipe:{token}").as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!(r"\\.\pipe\darwaza-agent-{}", &hex[..32])
 }
 
 /// Пути вычисляются так же, как в приложении.
@@ -648,9 +709,20 @@ fn ask_app(method: &str, params: Value) -> Result<Value, String> {
 /// сотни раз. Тянуть в неё половину приложения ради двух путей — плохой
 /// размен.
 fn token_path() -> Result<std::path::PathBuf, String> {
-    Ok(state_dir()?.join("agent-token"))
+    // На Windows токен лежит в `%LOCALAPPDATA%`, а не в Roaming — как в приложении.
+    #[cfg(windows)]
+    {
+        let dirs = directories::ProjectDirs::from("dev", "darwaza", "darwaza")
+            .ok_or("не удалось определить каталог приложения")?;
+        Ok(dirs.data_local_dir().join("agent-token"))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(state_dir()?.join("agent-token"))
+    }
 }
 
+#[cfg(unix)]
 fn socket_path() -> Result<std::path::PathBuf, String> {
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
         return Ok(std::path::PathBuf::from(runtime)
@@ -660,6 +732,7 @@ fn socket_path() -> Result<std::path::PathBuf, String> {
     Ok(state_dir()?.join("agent.sock"))
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn state_dir() -> Result<std::path::PathBuf, String> {
     let dirs = directories::ProjectDirs::from("dev", "darwaza", "darwaza")
         .ok_or("не удалось определить каталог приложения")?;
@@ -672,6 +745,17 @@ fn state_dir() -> Result<std::path::PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Имя канала совпадает с тем, что считает приложение (`agent::pipe_name`).
+    /// Те же входные данные и тот же ответ проверяются там — расхождение
+    /// оставило бы Windows без связи.
+    #[test]
+    fn pipe_name_matches_the_app() {
+        assert_eq!(
+            pipe_name("test-token"),
+            r"\\.\pipe\darwaza-agent-4b2a71fa45091137a84a869a7ed2f210"
+        );
+    }
 
     /// Каждый описанный агенту инструмент проведён в приложение.
     #[test]

@@ -9,6 +9,8 @@
 //! шлёт события прогресса. Отмена — через флаг, который задача проверяет
 //! на каждом куске.
 
+pub mod tree;
+
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +23,8 @@ use uuid::Uuid;
 pub enum TransferKind {
     Upload,
     Download,
+    /// Между двумя серверами, потоком через приложение.
+    Copy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -49,6 +53,10 @@ pub struct TransferProgress {
     /// Куда легло — чтобы UI мог показать путь после скачивания.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_path: Option<String>,
+    /// Файл внутри папки, на котором остановилась передача, или тот, что
+    /// копируется сейчас.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_path: Option<String>,
 }
 
 struct TransferHandle {

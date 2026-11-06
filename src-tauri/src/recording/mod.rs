@@ -499,6 +499,7 @@ mod tests {
     ///
     /// Тест идёт с `umask 0`, иначе при обычной маске права получились бы
     /// узкими и без исправления.
+    #[cfg(unix)] // права файла в стиле unix; на Windows их задаёт профиль пользователя
     #[test]
     fn a_recording_is_private_from_the_first_byte() {
         let dir = std::env::temp_dir().join(format!("darwaza-rec-perm-{}", std::process::id()));
@@ -541,6 +542,7 @@ mod tests {
     /// Пометка «идёт» не зависит от того, каким путём называют файл. Каталог за
     /// символической ссылкой: открыли по ссылке, проверяют по настоящему пути —
     /// и идущую запись нельзя было бы отличить от остановленной.
+    #[cfg(unix)] // символические ссылки на Windows требуют особых прав
     #[tokio::test]
     async fn a_running_recording_is_recognised_through_a_symlinked_directory() {
         let base = std::env::temp_dir().join(format!("darwaza-rec-link-{}", std::process::id()));

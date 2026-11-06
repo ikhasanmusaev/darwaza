@@ -231,6 +231,8 @@ test.describe("S214 — читающие команды с sudo для аген�
     // Поле прячется, пока доступ агента выключен: разрешать команды серверу,
     // к которому агента не пускают, незачем.
     await expect(page.getByTestId("host-agent-sudo")).toBeHidden();
+    // Настройки помощника лежат в свёрнутом разделе внизу формы.
+    await page.getByTestId("host-ai-toggle").click();
     await page.getByTestId("host-agent-access").click();
     await page.getByRole("button", { name: "Yoqish", exact: true }).click();
     await expect(page.getByTestId("host-agent-sudo")).toBeVisible();

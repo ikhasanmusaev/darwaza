@@ -3,8 +3,10 @@
 //! Права на файл токена — это то, что нельзя проверить по коду: важно, каким
 //! файл получился на диске, а не какие флаги передали в вызов.
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+#[cfg(unix)] // права файла в стиле unix; на Windows их задаёт профиль пользователя
 #[test]
 fn token_file_is_readable_only_by_owner() {
     // Токен даёт доступ ко всем разрешённым боевым серверам. Файл, который
@@ -44,10 +46,25 @@ fn token_file_is_readable_only_by_owner() {
 fn token_survives_restart_and_does_not_change() {
     // Меняющийся при каждом запуске токен ломал бы настроенного агента после
     // перезапуска приложения — и человек решил бы, что сломалась интеграция.
-    let first = darwaza_lib::agent::ensure_token().expect("первый вызов");
-    let second = darwaza_lib::agent::ensure_token().expect("повторный вызов");
+    //
+    // Работаем во временной папке: настоящий `ensure_token()` читает и пишет
+    // рабочий токен разработчика, а на Windows ещё и удаляет его копию в
+    // Roaming — прогон тестов не должен ломать настроенного агента.
+    let dir = std::env::temp_dir().join(format!("darwaza-token-test-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).expect("временная папка");
+    let path = dir.join("agent-token");
+
+    let first = darwaza_lib::agent::ensure_token_at(&path).expect("первый вызов");
+    let second = darwaza_lib::agent::ensure_token_at(&path).expect("повторный вызов");
     assert_eq!(first, second, "токен обязан быть постоянным");
     assert_eq!(first.len(), 64, "32 байта в hex");
+    assert_ne!(
+        Some(path.as_path()),
+        darwaza_lib::agent::token_path().ok().as_deref(),
+        "тест не должен работать с настоящим токеном"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -56,7 +73,7 @@ fn token_survives_restart_and_does_not_change() {
 
 use darwaza_lib::agent::{AgentHandler, AgentResponse};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 /// Подставной обработчик: считает вызовы и отвечает эхом.
 struct Probe {
@@ -73,6 +90,7 @@ impl AgentHandler for Probe {
 
 /// Отдельный сокет на тест: общий путь заставляет тесты драться за него, и
 /// падает не тот, кто виноват.
+#[cfg(unix)]
 fn temp_socket(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("darwaza-agent-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("каталог");
@@ -80,11 +98,8 @@ fn temp_socket(name: &str) -> std::path::PathBuf {
 }
 
 /// Отправить строку и прочитать ответ.
-async fn ask(path: &std::path::Path, line: &str) -> serde_json::Value {
-    let stream = tokio::net::UnixStream::connect(path)
-        .await
-        .expect("подключение");
-    let (read, mut write) = stream.into_split();
+async fn exchange<S: AsyncRead + AsyncWrite>(stream: S, line: &str) -> serde_json::Value {
+    let (read, mut write) = tokio::io::split(stream);
     write
         .write_all(format!("{line}\n").as_bytes())
         .await
@@ -95,15 +110,51 @@ async fn ask(path: &std::path::Path, line: &str) -> serde_json::Value {
     serde_json::from_str(&answer).expect("ответ — JSON")
 }
 
+#[cfg(unix)]
+async fn ask(path: &std::path::Path, line: &str) -> serde_json::Value {
+    let stream = tokio::net::UnixStream::connect(path)
+        .await
+        .expect("подключение");
+    exchange(stream, line).await
+}
+
+#[cfg(windows)]
+async fn ask(name: &std::path::Path, line: &str) -> serde_json::Value {
+    let stream = tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(name)
+        .expect("подключение к каналу");
+    exchange(stream, line).await
+}
+
+/// Где поднять слушатель в тесте: отдельный сокет на unix, отдельный канал на
+/// Windows (имя с номером процесса, чтобы параллельные тесты не дрались).
+async fn listen(
+    name: &str,
+    handler: Arc<dyn AgentHandler>,
+    token: String,
+) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        darwaza_lib::agent::serve_at(temp_socket(name), handler, token)
+            .await
+            .expect("слушатель")
+    }
+    #[cfg(windows)]
+    {
+        let pipe = format!(r"\\.\pipe\darwaza-test-{}-{name}", std::process::id());
+        darwaza_lib::agent::serve_pipe(pipe, handler, token)
+            .await
+            .expect("слушатель")
+    }
+}
+
 #[tokio::test]
 async fn listener_answers_authorized_requests_and_refuses_the_rest() {
     let token = "0".repeat(64);
     let probe = Arc::new(Probe {
         calls: std::sync::Mutex::new(Vec::new()),
     });
-    let path = darwaza_lib::agent::serve_at(temp_socket("answers"), probe.clone(), token.clone())
-        .await
-        .expect("слушатель");
+    let path = listen("answers", probe.clone(), token.clone()).await;
 
     // Верный токен — запрос доходит до обработчика.
     let ok = ask(
@@ -139,6 +190,7 @@ async fn listener_answers_authorized_requests_and_refuses_the_rest() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn socket_is_reachable_only_by_owner() {
     let token = "1".repeat(64);
@@ -158,6 +210,49 @@ async fn socket_is_reachable_only_by_owner() {
         mode, 0o600,
         "сокет должен быть доступен только владельцу, получено {mode:o}"
     );
+}
+
+/// Канал, который поднял сам процесс, посредник признаёт своим: проверка
+/// владельца (SID процесса-сервера совпадает с текущим пользователем) не
+/// должна отвергать законный канал. Запускается только на Windows.
+#[cfg(windows)]
+#[tokio::test]
+async fn the_pipe_of_our_own_process_passes_the_owner_check() {
+    let probe = Arc::new(Probe {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let name = listen("owner", probe, "2".repeat(64)).await;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&name)
+        .expect("подключение к каналу");
+    assert!(darwaza_lib::winsec::server_is_current_user(&file).expect("проверка владельца"));
+}
+
+/// Токен после записи закрыт списком доступа без наследования: никаких записей
+/// от каталога, кроме текущего пользователя. Только Windows.
+#[cfg(windows)]
+#[test]
+fn the_token_file_is_locked_to_the_current_user() {
+    let dir = std::env::temp_dir().join(format!("darwaza-acl-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("каталог");
+    let file = dir.join("agent-token");
+    std::fs::write(&file, "").expect("файл");
+    darwaza_lib::winsec::restrict_to_current_user(&file).expect("права");
+    // Записать и прочитать текущему пользователю по-прежнему можно.
+    std::fs::write(&file, "secret").expect("запись владельцем");
+    assert_eq!(std::fs::read_to_string(&file).expect("чтение владельцем"), "secret");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Имя канала зависит от токена и не угадывается без него (#160).
+#[test]
+fn pipe_name_is_derived_from_the_token() {
+    let a = darwaza_lib::agent::pipe_name("test-token");
+    assert_eq!(a, r"\\.\pipe\darwaza-agent-4b2a71fa45091137a84a869a7ed2f210");
+    assert_ne!(a, darwaza_lib::agent::pipe_name("other-token"));
+    assert!(!a.contains("test-token"), "токен в имени канала виден всем");
 }
 
 // ─────────────────────────────────────────────────────────────────────────

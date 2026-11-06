@@ -34,6 +34,12 @@ pub mod codes {
     pub const NOT_FOUND: &str = "errors.notFound";
     /// Порт вне допустимого диапазона.
     pub const INVALID_PORT: &str = "errors.invalidPort";
+    /// Адрес хоста пуст (после обрезки пробелов) или содержит пробел внутри.
+    pub const INVALID_HOSTNAME: &str = "errors.invalidHostname";
+    /// Имя пользователя пусто (после обрезки пробелов) или содержит пробел внутри.
+    pub const INVALID_USERNAME: &str = "errors.invalidUsername";
+    /// Название хоста пусто после обрезки пробелов.
+    pub const NAME_REQUIRED: &str = "errors.nameRequired";
     /// Интервал keep-alive вне диапазона.
     pub const INVALID_KEEP_ALIVE: &str = "errors.invalidKeepAlive";
     /// Ключ настройки не из списка разрешённых для записи из окна.

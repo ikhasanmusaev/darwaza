@@ -105,6 +105,21 @@ pub fn state_dir() -> Result<PathBuf> {
         .to_path_buf())
 }
 
+/// Где лежит то, что не должно уезжать с профилем на другие машины: токен
+/// агента. На Windows каталог данных — `%APPDATA%` (Roaming), и в домене он
+/// переезжает вместе с перемещаемым профилем; берём `%LOCALAPPDATA%`. На
+/// остальных системах это каталог состояния, как и было.
+pub fn local_state_dir() -> Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        Ok(project_dirs()?.data_local_dir().to_path_buf())
+    }
+    #[cfg(not(windows))]
+    {
+        state_dir()
+    }
+}
+
 /// Нужно ли переносить: старое есть, нового ещё нет.
 ///
 /// Вынесено отдельной функцией, чтобы правило можно было проверить тестом,
@@ -163,12 +178,14 @@ pub fn migrate_from_legacy_name() {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     /// Выполнить с `umask 0`. Права файла по умолчанию — `0666 & ~umask`, и при
     /// привычной `022` или `077` тест на `0600` проходил бы и без исправления:
     /// чтобы он что-то проверял, маску надо снять. `umask` общая для процесса,
     /// поэтому тесты, которые её трогают, идут по очереди.
+    #[cfg(unix)]
     pub(crate) fn with_open_umask<T>(f: impl FnOnce() -> T) -> T {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -178,12 +195,14 @@ pub(crate) mod tests {
         result
     }
 
+    #[cfg(unix)]
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("darwaza-perm-{}-{name}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         dir
     }
 
+    #[cfg(unix)] // права файла в стиле unix; на Windows их задаёт профиль пользователя
     #[test]
     fn a_private_dir_is_0700_even_when_it_already_existed_open() {
         let dir = scratch("dir");
@@ -203,6 +222,7 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)] // права файла в стиле unix; на Windows их задаёт профиль пользователя
     #[test]
     fn tighten_file_closes_an_open_file_and_ignores_a_missing_one() {
         let dir = scratch("file");

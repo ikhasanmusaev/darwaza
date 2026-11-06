@@ -43,3 +43,21 @@ test.describe("S9 — i18n language switch", () => {
     await expect(sidebar.getByRole("button", { name: "Хосты" })).toBeVisible();
   });
 });
+
+test("подпись режима внизу сайдбара не обрезается ни на одном языке", async ({ page }) => {
+  // Длинное «Локальный режим · синхронизация выключена» раньше не
+  // переносилось и уходило за край сайдбара.
+  for (const locale of ["uz", "ru", "en", "kk", "ky", "tr"]) {
+    await page.goto("/settings");
+    await page.evaluate((l) => window.localStorage.setItem("locale", l), locale);
+    await page.reload();
+    const status = page.getByTestId("local-mode-status");
+    await expect(status).toBeVisible();
+    const clipped = await status.evaluate((el) => {
+      const side = el.closest("aside")!.getBoundingClientRect();
+      const r = el.getBoundingClientRect();
+      return r.right > side.right + 0.5 || el.scrollWidth > el.clientWidth + 0.5;
+    });
+    expect(clipped, locale).toBe(false);
+  }
+});

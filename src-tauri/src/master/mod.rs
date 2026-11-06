@@ -95,7 +95,12 @@ const VAULT_VERSION_CURRENT: &str = "2";
 
 /// Открытый текст verifier'а. Значение неважно — важно, что оно известно
 /// заранее и потому расшифровка либо сходится, либо нет.
-const VERIFIER_PLAINTEXT: &[u8] = b"termius-analog:master-verifier:v1";
+const VERIFIER_PLAINTEXT: &[u8] = b"darwaza:master-verifier:v1";
+
+/// Открытый текст verifier'а хранилищ, заведённых до 0.1.1 (прежнее имя
+/// продукта). Принимается при проверке пароля и после успешного ввода
+/// заменяется на `VERIFIER_PLAINTEXT`; хранилище при этом не меняется.
+const LEGACY_VERIFIER_PLAINTEXT: &[u8] = b"termius-analog:master-verifier:v1";
 
 /// Параметры Argon2id: 64 МиБ, 3 прохода, 1 поток.
 ///
@@ -576,8 +581,26 @@ impl MasterKeyring {
 
         match decrypt(&kek, &nonce, &verifier) {
             Ok(plain) if plain == VERIFIER_PLAINTEXT => Ok(kek),
+            Ok(plain) if plain == LEGACY_VERIFIER_PLAINTEXT => {
+                // Пароль верен, verifier прежнего образца: переписываем
+                // новым. Не вышло записать — не страшно, повторим при
+                // следующем вводе, а человека впускаем в любом случае.
+                if let Err(e) = self.rewrite_verifier(db, &kek).await {
+                    tracing::warn!(target: "master", "verifier не обновлён: {e}");
+                }
+                Ok(kek)
+            }
             _ => Err(self.fail_attempt(codes::MASTER_WRONG_PASSWORD).await),
         }
+    }
+
+    async fn rewrite_verifier(&self, db: &SqlitePool, kek: &DerivedKey) -> Result<()> {
+        let (nonce, verifier) = encrypt(kek, VERIFIER_PLAINTEXT)?;
+        let mut tx = db.begin().await?;
+        put(&mut tx, keys::VERIFIER_NONCE, &B64.encode(&nonce)).await?;
+        put(&mut tx, keys::VERIFIER, &B64.encode(&verifier)).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Получить ключ данных по проверенному ключу из пароля.
@@ -1060,6 +1083,44 @@ mod vault_tests {
             .await
             .expect("вход с верным паролем и верным кодом обязан проходить");
         assert!(master.is_unlocked().await);
+    }
+
+    /// Хранилище, заведённое 0.1.0, открывается и после этого переходит на
+    /// новый verifier. Неверный пароль по-прежнему не проходит.
+    #[tokio::test]
+    async fn a_0_1_0_vault_opens_and_moves_to_the_new_verifier() {
+        let db = fresh_db().await;
+        let master = vault_with_secret(&db).await;
+
+        // Состояние 0.1.0: verifier зашифрован старым открытым текстом.
+        let kek = master
+            .derive_from_settings(&db, "пароль-мастер-12")
+            .await
+            .expect("ключ");
+        let (nonce, legacy) = encrypt(&kek, LEGACY_VERIFIER_PLAINTEXT).expect("verifier");
+        let mut tx = db.begin().await.expect("транзакция");
+        put(&mut tx, keys::VERIFIER_NONCE, &B64.encode(&nonce)).await.expect("nonce");
+        put(&mut tx, keys::VERIFIER, &B64.encode(&legacy)).await.expect("verifier");
+        tx.commit().await.expect("запись");
+        master.lock().await;
+
+        assert!(master.unlock(&db, "чужой-пароль-12!", None).await.is_err());
+        master
+            .unlock(&db, "пароль-мастер-12", None)
+            .await
+            .expect("хранилище 0.1.0 обязано открываться");
+        assert_eq!(secret(&master, &db).await.as_deref(), Some("пароль-от-сервера"));
+
+        let nonce = setting_bytes(&db, keys::VERIFIER_NONCE).await.expect("чтение").expect("nonce");
+        let stored = setting_bytes(&db, keys::VERIFIER).await.expect("чтение").expect("verifier");
+        assert_eq!(
+            decrypt(&kek, &nonce, &stored).expect("расшифровка"),
+            VERIFIER_PLAINTEXT,
+            "после успешного ввода verifier обязан стать новым"
+        );
+
+        master.lock().await;
+        master.unlock(&db, "пароль-мастер-12", None).await.expect("повторный вход");
     }
 
     /// Главный путь: забыли пароль, ввели ключ, задали новый.

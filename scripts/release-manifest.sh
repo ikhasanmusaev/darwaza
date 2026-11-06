@@ -113,20 +113,33 @@ ls -1 "$out"
 # как повезёт.
 sig_file="$(find "$bundle" -name '*.AppImage.sig' | head -1)"
 [ -n "$sig_file" ] || sig_file="$(find "$bundle" -name '*.deb.sig' | head -1)"
-if [ -n "$sig_file" ]; then
-  pkg="$(basename "${sig_file%.sig}")"
-  cat > "$out/latest.json" <<JSON
-{
-  "version": "$version",
-  "pub_date": "$released_at",
-  "platforms": {
-    "linux-x86_64": {
-      "signature": "$(cat "$sig_file")",
-      "url": "$base_url/$pkg"
+# Windows: установщик NSIS. Updater шлёт платформу как «windows-x86_64».
+win_sig="$(find "$bundle" -name '*-setup.exe.sig' | head -1)"
+if [ -n "$sig_file" ] || [ -n "$win_sig" ]; then
+  VERSION="$version" BASE_URL="$base_url" RELEASED_AT="$released_at" OUT="$out" \
+    LINUX_SIG="$sig_file" WIN_SIG="$win_sig" python3 - <<'PY'
+import json, os, pathlib
+from urllib.parse import quote
+
+platforms = {}
+for key, env in (('linux-x86_64', 'LINUX_SIG'), ('windows-x86_64', 'WIN_SIG')):
+    sig = os.environ.get(env)
+    if not sig:
+        continue
+    sig = pathlib.Path(sig)
+    pkg = sig.name[:-len('.sig')]
+    platforms[key] = {
+        'signature': sig.read_text().strip(),
+        'url': f"{os.environ['BASE_URL']}/{quote(pkg)}",
     }
-  }
+manifest = {
+    'version': os.environ['VERSION'],
+    'pub_date': os.environ['RELEASED_AT'],
+    'platforms': platforms,
 }
-JSON
+pathlib.Path(os.environ['OUT'], 'latest.json').write_text(
+    json.dumps(manifest, ensure_ascii=False, indent=2) + '\n')
+PY
   echo "манифест обновлений: $out/latest.json"
 else
   echo "ВНИМАНИЕ: подписи не найдено — latest.json не создан." >&2

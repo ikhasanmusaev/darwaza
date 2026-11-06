@@ -9,6 +9,7 @@ import { applyAppTheme } from "../lib/theme";
 import MasterPasswordSection from "../components/MasterPasswordSection.vue";
 import SecretsPlaceSection from "../components/SecretsPlaceSection.vue";
 import CrashReportsSection from "../components/CrashReportsSection.vue";
+import LogsSection from "../components/LogsSection.vue";
 import PageHeader from "../components/PageHeader.vue";
 import SyncAccountSection from "../components/SyncAccountSection.vue";
 import { setLocale, type Locale } from "../i18n";
@@ -109,7 +110,7 @@ const language = ref<Locale>(locale.value as Locale);
  * серверами и ждёт увидеть их снова. Выключается для тех, кому каждый запуск
  * важно начинать с чистого листа.
  */
-const restoreTabs = ref(settings.get("session.restore_tabs") !== "false");
+const restoreTabs = ref(settings.get("session.restore_tabs") === "true");
 
 /**
  * Проверка обновлений (#164).
@@ -373,6 +374,7 @@ function saveLanguage() {
     </div>
 
     <div v-show="activeSection === 'reports'">
+      <LogsSection />
       <CrashReportsSection />
     </div>
 

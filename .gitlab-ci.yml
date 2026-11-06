@@ -6,10 +6,10 @@
 #   3. собирает .deb, .rpm и AppImage;
 #   4. считает контрольные суммы и делает releases.json для витрины;
 #   5. кладёт файлы в реестр пакетов проекта;
-#   6. создаёт релиз с описанием ИЗ CHANGELOG.md.
+#   6. создаёт релиз с описанием из CHANGELOG.md, CHANGELOG_ru.md и CHANGELOG_uz.md.
 #
 # Почему описание берётся из файла, а не пишется в пайплайне: написанное в двух
-# местах расходится молча. CHANGELOG.md — единственный источник.
+# местах расходится молча. Три файла журнала — единственный источник.
 #
 # Живые тесты синхронизации (`#[ignore]`) и e2e рабочего стола здесь НЕ идут:
 # первым нужен настоящий сервер, вторым — запущенное окно приложения. Молчать
@@ -19,6 +19,7 @@
 stages:
   - checks
   - build
+  - assemble
   - publish
   - release
 
@@ -39,7 +40,10 @@ variables:
 workflow:
   rules:
     # Метка выпуска — единственное, что запускает сборку и публикацию.
-    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
+    # `vX.Y.Z-rcN` — предварительная версия: те же сборки, на GitHub она
+    # выходит как prerelease, а файлы для сайта и обновления никуда сами не
+    # попадают (их кладут на сервер руками, см. ci.md). Версия в файлах — X.Y.Z.
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$/
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
     # Всё прочее пайплайна не заводит: двойные прогоны на ветку и на MR — шум.
@@ -91,6 +95,8 @@ versions:
     # На метке сверяем ещё и с ней: v0.2.0 на коде 0.1.9 — обычная ошибка
     # спешки, и стоит она выпущенного пакета с чужим номером.
     - ./scripts/check-versions.sh ${CI_COMMIT_TAG:-}
+    # Сборка описания релиза из трёх языков не должна молча терять язык.
+    - ./scripts/test-release-notes.sh
 
 test:desktop:
   extends: .linux-toolchain
@@ -146,7 +152,8 @@ build:linux:
     # сюда значило бы завести её копию, а копия расходится молча. Проверка
     # делается на стороне сервера перед тем, как файл начнёт отдаваться
     # витриной (docs/07-release/ci.md).
-    - ./scripts/release-notes.sh "$VERSION" > dist-release/release-notes.md
+    # Заметки берутся из раздела CHANGELOG без «-rcN»: проба 0.1.1-rc2 — это 0.1.1.
+    - ./scripts/release-notes.sh "${VERSION%-rc*}" > dist-release/release-notes.md
     # Имена файлов заранее не известны — их подставляет сборщик. Передаём
     # готовые ссылки следующим шагам, чтобы те не гадали.
     - |
@@ -164,6 +171,8 @@ build:linux:
     name: "darwaza-$CI_COMMIT_TAG"
     paths:
       - dist-release/
+      # Подписи обновлений нужны шагу assemble:release (latest.json).
+      - src-tauri/target/release/bundle/**/*.sig
     reports:
       dotenv: release.env
     expire_in: never
@@ -196,15 +205,43 @@ build:windows:
   variables:
     # MSVC, а не GNU: WebView2 и подписывание работают только с ним.
     RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-msvc
+    # Явные каталоги Rust. Через chocolatey (rustup.install) rustup ложился
+    # неизвестно куда: в профиль другого пользователя, и `rustup` не находился
+    # даже после дописывания $USERPROFILE\.cargo\bin в PATH (rc1, 2026-11-05).
+    RUSTUP_HOME: C:\rust\rustup
+    CARGO_HOME: C:\rust\cargo
   before_script:
-    - choco install -y rustup.install --no-progress
-    - rustup default $env:RUSTUP_TOOLCHAIN
+    - Invoke-WebRequest -Uri https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe -OutFile rustup-init.exe
+    - .\rustup-init.exe -y --no-modify-path --profile minimal --default-toolchain $env:RUSTUP_TOOLCHAIN
+    - $env:Path = "$env:CARGO_HOME\bin;$env:Path"
+    - rustc --version
+    - |
+      # На образе раннера Node 21, а pnpm 11 на нём падает при запуске
+      # (ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING, rc2). Ставим свой Node 22 LTS.
+      Invoke-WebRequest -Uri https://nodejs.org/dist/v22.23.4/node-v22.23.4-win-x64.zip -OutFile node.zip
+      Expand-Archive node.zip -DestinationPath C:\node
+      $env:Path = "C:\node\node-v22.23.4-win-x64;$env:Path"
+    - node --version
     - corepack enable
     - pnpm install --frozen-lockfile
   script:
     # Даёт .msi и установщик NSIS (.exe). Оба идут на витрину: msi ставится
     # политиками в организациях, exe привычнее человеку.
-    - pnpm tauri build
+    #
+    # При `createUpdaterArtifacts: true` сборка без ключа подписи обновлений
+    # падает уже ПОСЛЕ установщиков, с кодом 1. Ключ в CI берётся из переменной
+    # проекта; если её нет — собираем без артефактов обновления отдельным
+    # файлом настроек (без копирования ключа на машину и без правки основной
+    # конфигурации). То же для локальной сборки на Windows:
+    #   pnpm tauri build --config src-tauri/tauri.no-updater.conf.json
+    - |
+      if ($env:TAURI_SIGNING_PRIVATE_KEY) {
+        pnpm tauri build
+      } else {
+        Write-Host "ВНИМАНИЕ: TAURI_SIGNING_PRIVATE_KEY не задан — собираю без артефактов обновления."
+        pnpm tauri build --config src-tauri/tauri.no-updater.conf.json
+      }
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   artifacts:
     name: "darwaza-windows-$CI_COMMIT_TAG"
     paths:
@@ -243,6 +280,52 @@ build:macos:
   # APPLE_ID и APPLE_PASSWORD задаются владельцем в настройках проекта, и
   # Tauri подхватывает их сам. Молчать об этом нельзя: неподписанная сборка
   # выглядит для человека как сломанная.
+
+# Сборка выпуска из всех систем в один каталог. Linux и Windows собираются
+# разными заданиями на разных машинах, и без этого шага Windows-установщик
+# оставался бы артефактом своего задания: ни на GitHub, ни в releases.json,
+# ни в контрольных суммах его не было бы.
+assemble:release:
+  stage: assemble
+  image: debian:bookworm-slim
+  needs:
+    - job: build:linux
+      artifacts: true
+    # Windows-раннер платный и может быть выключен; тогда выпуск выходит без
+    # Windows, но об этом сказано громко (см. скрипт).
+    - job: build:windows
+      artifacts: true
+      optional: true
+  rules:
+    - if: $CI_COMMIT_TAG
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends python3 coreutils findutils
+  script:
+    - export VERSION=${CI_COMMIT_TAG#v}
+    - export PUBLIC_BASE="${DOWNLOAD_BASE_URL:-$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/darwaza/$VERSION}"
+    # Плоский каталог со всеми пакетами и подписями обновлений. Linux-файлы
+    # берём из готового dist-release (подписи .sig там нет, поэтому
+    # собираем их из bundle ниже, если он есть).
+    - mkdir -p merged
+    - find dist-release -maxdepth 1 -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) -exec cp {} merged/ \;
+    - |
+      if [ -d src-tauri/target/release/bundle ]; then
+        find src-tauri/target/release/bundle -type f \( -name '*.sig' -o -name '*.msi' -o -name '*-setup.exe' \) -exec cp {} merged/ \;
+      fi
+    - |
+      if ! ls merged/*-setup.exe >/dev/null 2>&1; then
+        echo "################################################################"
+        echo "ВНИМАНИЕ: Windows-установщика нет — build:windows не дал результата."
+        echo "Выпуск выйдет только для Linux. Проверьте задание build:windows."
+        echo "################################################################"
+      fi
+    - BUNDLE_DIR=merged ./scripts/release-manifest.sh "$VERSION" "$PUBLIC_BASE" dist-final
+    - ./scripts/release-notes.sh "${VERSION%-rc*}" > dist-final/release-notes.md
+  artifacts:
+    name: "darwaza-final-$CI_COMMIT_TAG"
+    paths:
+      - dist-final/
+    expire_in: never
 
 # --------------------------------------------------------------- публикация
 
@@ -287,9 +370,14 @@ publish:github:
   stage: publish
   image: alpine:latest
   needs:
-    - job: build:linux
+    - job: assemble:release
       artifacts: true
+  # Пробные метки vX.Y.Z-rcN на витрину не идут: их проверяет владелец, файлы
+  # берутся из артефактов assemble:release. Иначе GitHub создал бы метку сам —
+  # на том коммите, что там окажется, а не на нашем.
   rules:
+    - if: $CI_COMMIT_TAG =~ /-rc[0-9]+$/
+      when: never
     - if: $CI_COMMIT_TAG
   allow_failure: true
   before_script:
@@ -313,13 +401,14 @@ publish:github:
         id=$(curl --fail-with-body --silent --show-error --request POST \
           --header "$auth" --header "Content-Type: application/json" \
           --data "$(jq -n --arg tag "$CI_COMMIT_TAG" \
-                      --rawfile body dist-release/release-notes.md \
-                      '{tag_name: $tag, name: $tag, body: $body}')" \
+                      --rawfile body dist-final/release-notes.md \
+                      '{tag_name: $tag, name: $tag, body: $body,
+                       prerelease: ($tag | test("-rc[0-9]+$"))}')" \
           "$api/releases" | jq -r '.id')
       fi
       [ -n "$id" ] || { echo "не удалось создать релиз на GitHub" >&2; exit 1; }
 
-      for file in dist-release/*; do
+      for file in dist-final/*; do
         name=$(basename "$file")
         echo "Выкладываю $name"
         # Существующий файл с тем же именем удаляем: GitHub не заменяет их

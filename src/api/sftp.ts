@@ -15,6 +15,16 @@ export interface SftpEntry {
 }
 
 export const sftpApi = {
+  /**
+   * Соединение только для файлов (экран SFTP): вход и проверка ключа хоста те
+   * же, что у терминала, но без оболочки и без вкладки. Возвращает id сразу;
+   * готовность приходит событием `session:status`.
+   */
+  connect: (hostId: number) => invoke<{ sessionId: string }>("sftp_connect", { hostId }),
+
+  /** Закрыть такое соединение целиком (не только SFTP-подсистему). */
+  disconnect: (sessionId: string) => invoke<void>("ssh_disconnect", { sessionId }),
+
   /** Домашняя директория пользователя на сервере — точка входа браузера файлов. */
   home: (sessionId: string) => invoke<string>("sftp_home", { sessionId }),
 

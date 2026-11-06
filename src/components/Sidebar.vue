@@ -13,7 +13,9 @@ import {
   Film,
   Laptop,
   Server,
+  ArrowLeftRight,
 } from "lucide-vue-next";
+import { getVersion } from "@tauri-apps/api/app";
 import { useSessionsStore } from "../stores/sessions";
 import { useSftpStore } from "../stores/sftp";
 import { useSnippetsStore } from "../stores/snippets";
@@ -32,6 +34,7 @@ const syncLabel = computed(() =>
   syncStore.status?.signedIn && syncStore.auto ? t("nav.syncOn") : t("nav.syncOff"),
 );
 const showTerminalTree = computed(() => sessionsStore.activeSessionId !== null);
+const appVersion = ref("");
 let unlistenSync: UnlistenFn | null = null;
 
 function navigate(path: string) {
@@ -40,6 +43,8 @@ function navigate(path: string) {
 }
 
 onMounted(async () => {
+  // Настоящая версия приложения, а не вписанная в код.
+  getVersion().then((v) => (appVersion.value = v)).catch(() => undefined);
   await snippetsStore.ensureLoaded();
   unlistenSync = await syncStore.subscribe();
 });
@@ -73,7 +78,7 @@ async function runSnippet(s: Snippet) {
     <div class="h-14 px-4 border-b border-edge-subtle flex items-center gap-2.5">
       <GateMark :size="22" class="text-accent" />
       <h1 class="text-logo text-on-surface">{{ t("app.title") }}</h1>
-      <span class="ml-auto text-[11px] text-on-surface-muted">v0.1</span>
+      <span v-if="appVersion" class="ml-auto text-[11px] text-on-surface-muted" data-testid="app-version">v{{ appVersion }}</span>
     </div>
 
     <nav class="flex-1 overflow-y-auto px-3 py-3">
@@ -150,6 +155,21 @@ async function runSnippet(s: Snippet) {
 
         <button
           type="button"
+          data-testid="sidebar-sftp"
+          class="w-full flex items-center gap-2.5 px-3 h-8 rounded-r8 text-left text-body text-on-surface-muted hover:bg-surface-alt hover:text-on-surface"
+          :class="
+            $route.path.startsWith('/sftp') && sessionsStore.activeSessionId === null
+              ? 'bg-surface-alt font-semibold text-on-surface'
+              : ''
+          "
+          @click="navigate('/sftp')"
+        >
+          <ArrowLeftRight :size="16" />
+          <span>{{ t("nav.sftp") }}</span>
+        </button>
+
+        <button
+          type="button"
           class="w-full flex items-center gap-2.5 px-3 h-8 rounded-r8 text-left text-body text-on-surface-muted hover:bg-surface-alt hover:text-on-surface"
           :class="
             $route.path.startsWith('/forwards') && sessionsStore.activeSessionId === null
@@ -218,7 +238,7 @@ async function runSnippet(s: Snippet) {
 
     <div class="border-t border-edge-subtle px-4 py-3 flex items-start gap-2.5 text-on-surface-muted">
       <Laptop :size="15" class="mt-0.5 shrink-0" />
-      <p class="text-[11px] leading-4 whitespace-nowrap" data-testid="local-mode-status">
+      <p class="min-w-0 text-[11px] leading-4" data-testid="local-mode-status">
         {{ t("nav.localMode") }}<span v-if="syncLabel"> · {{ syncLabel }}</span>
       </p>
     </div>

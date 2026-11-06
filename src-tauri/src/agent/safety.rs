@@ -416,12 +416,34 @@ pub fn sudo_allowlist(raw: Option<&str>) -> Vec<String> {
 /// подтверждающий план из тридцати шагов, не обязан замечать `mkfs` в
 /// семнадцатом.
 pub fn is_forbidden_outright(command: &str) -> Option<String> {
+    forbidden_detail(command).map(|f| f.reason)
+}
+
+/// Запрет вместе с машинным видом причины.
+///
+/// Текст `reason` русский и уходит агенту как есть. Окно подтверждения
+/// показывает причину на языке интерфейса, поэтому ему нужен не текст, а
+/// `code` и `arg`: по ним оно подбирает перевод.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forbidden {
+    pub reason: String,
+    /// `protected_path`, `never`, `device_write`, `delete_root`.
+    pub code: &'static str,
+    /// Путь для `protected_path`, имя программы из таблицы для `never`.
+    pub arg: Option<String>,
+}
+
+pub fn forbidden_detail(command: &str) -> Option<Forbidden> {
     // Пути проверяем по строке целиком: они не привязаны к одной команде.
     for path in NEVER_TOUCH {
         if command.contains(path) && is_read_only(command).is_err() {
-            return Some(format!(
-                "изменение '{path}' через агента не выполняется: ошибка здесь лишает доступа и возможности исправить"
-            ));
+            return Some(Forbidden {
+                reason: format!(
+                    "изменение '{path}' через агента не выполняется: ошибка здесь лишает доступа и возможности исправить"
+                ),
+                code: "protected_path",
+                arg: Some(path.to_string()),
+            });
         }
     }
 
@@ -449,7 +471,7 @@ pub fn step_kind(command: &str) -> super::StepKind {
 }
 
 /// Проверка одной команды без разделителей.
-fn forbidden_command(command: &str) -> Option<String> {
+fn forbidden_command(command: &str) -> Option<Forbidden> {
     let trimmed = command.trim();
     let mut words = trimmed.split_whitespace();
     let head = words.next()?;
@@ -457,22 +479,29 @@ fn forbidden_command(command: &str) -> Option<String> {
 
     // Сравниваем и с формой «имя.суффикс»: в жизни разметку вызывают как
     // mkfs.ext4 или mkfs.xfs, и точное сравнение их пропускало. Тест поймал.
-    if let Some((_, what)) = NEVER
+    if let Some((key, what)) = NEVER
         .iter()
         .find(|(p, _)| *p == program || program.starts_with(&format!("{p}.")))
     {
-        return Some(format!(
-            "{what} не выполняется через агента ни с каким подтверждением: это делается руками в терминале"
-        ));
+        return Some(Forbidden {
+            reason: format!(
+                "{what} не выполняется через агента ни с каким подтверждением: это делается руками в терминале"
+            ),
+            code: "never",
+            arg: Some(key.to_string()),
+        });
     }
 
     // `dd` на устройство — необратимая запись поверх диска. Сам по себе `dd`
     // безобиден, опасен именно вывод в /dev.
     if program == "dd" && trimmed.contains("of=/dev/") {
-        return Some(
-            "запись напрямую на устройство не выполняется через агента: это делается руками в терминале"
-                .to_string(),
-        );
+        return Some(Forbidden {
+            reason:
+                "запись напрямую на устройство не выполняется через агента: это делается руками в терминале"
+                    .to_string(),
+            code: "device_write",
+            arg: None,
+        });
     }
 
     // `rm -rf /` и подобное. Проверяем именно корень: удаление рабочего
@@ -480,9 +509,12 @@ fn forbidden_command(command: &str) -> Option<String> {
     if program == "rm" {
         let rest: Vec<&str> = words.collect();
         if rest.iter().any(|w| *w == "/" || *w == "/*") {
-            return Some(
-                "удаление корня не выполняется через агента ни с каким подтверждением".to_string(),
-            );
+            return Some(Forbidden {
+                reason: "удаление корня не выполняется через агента ни с каким подтверждением"
+                    .to_string(),
+                code: "delete_root",
+                arg: None,
+            });
         }
     }
 

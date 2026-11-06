@@ -11,6 +11,8 @@ pub mod keyring_store;
 mod known_hosts;
 mod master;
 mod paths;
+#[cfg(windows)]
+pub mod winsec;
 mod pty;
 pub mod recording;
 pub mod recovery_key;
@@ -20,7 +22,7 @@ mod ssh;
 mod startup;
 pub mod sync;
 mod totp;
-mod transfers;
+pub mod transfers;
 
 use sqlx::SqlitePool;
 use std::path::PathBuf;
@@ -218,6 +220,13 @@ pub fn run() {
                             sync: sync::session::SyncSession::new(),
                         });
 
+                        // Однократный перенос паролей keyring со старого имени
+                        // службы: чтение переносит только прочитанное.
+                        {
+                            let state = handle.state::<AppState>();
+                            secrets::sweep_legacy_keyring(&state.db).await;
+                        }
+
                         start_agent_channel(&handle).await;
                         // Синхронизация по расписанию. Строго после
                         // регистрации состояния: задача берёт из него базу и
@@ -258,6 +267,7 @@ pub fn run() {
             commands::identity_set_password,
             commands::identity_set_passphrase,
             commands::ssh_connect,
+            commands::sftp_connect,
             commands::ssh_send,
             commands::ssh_resize,
             commands::ssh_latency,
@@ -282,6 +292,9 @@ pub fn run() {
             commands::onboarding_done,
             commands::recovery_key_save,
             commands::connection_logs_list,
+            commands::agent_log_list,
+            commands::logs_dir,
+            commands::logs_open_dir,
             commands::sync_status,
             commands::sync_set_endpoint,
             commands::sync_register,
@@ -313,6 +326,10 @@ pub fn run() {
             commands::local_home,
             commands::local_parent,
             commands::local_list,
+            commands::clipboard::clipboard_read_text,
+            commands::local_mkdir,
+            commands::local_rename,
+            commands::local_remove,
             commands::port_forwards_list,
             commands::port_forwards_create,
             commands::port_forwards_update,
@@ -340,6 +357,7 @@ pub fn run() {
             commands::recordings_dir,
             commands::transfer_download,
             commands::transfer_upload,
+            commands::transfer_tree,
             commands::transfer_cancel,
             commands::transfers_download_dir,
             commands::crash_reports_enabled,
