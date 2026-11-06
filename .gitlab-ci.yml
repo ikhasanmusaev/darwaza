@@ -1,0 +1,371 @@
+# Выпуск Darwaza через GitLab CI.
+#
+# Что делает пайплайн по метке vX.Y.Z:
+#   1. сверяет версию в четырёх файлах и метке — расхождение ловится ДО сборки;
+#   2. прогоняет тесты и сборку интерфейса;
+#   3. собирает .deb, .rpm и AppImage;
+#   4. считает контрольные суммы и делает releases.json для витрины;
+#   5. кладёт файлы в реестр пакетов проекта;
+#   6. создаёт релиз с описанием ИЗ CHANGELOG.md.
+#
+# Почему описание берётся из файла, а не пишется в пайплайне: написанное в двух
+# местах расходится молча. CHANGELOG.md — единственный источник.
+#
+# Живые тесты синхронизации (`#[ignore]`) и e2e рабочего стола здесь НЕ идут:
+# первым нужен настоящий сервер, вторым — запущенное окно приложения. Молчать
+# об этом нельзя, поэтому написано прямо здесь: зелёный пайплайн не заменяет
+# проверку установки на чистой системе (docs/07-release/production-plan.md, Э6).
+
+stages:
+  - checks
+  - build
+  - publish
+  - release
+
+variables:
+  # Кэши кладём внутрь рабочего каталога: снаружи GitLab их не сохранит.
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  PNPM_HOME: $CI_PROJECT_DIR/.pnpm
+  # Сборка в контейнере без FUSE: без этого AppImage не собирается.
+  APPIMAGE_EXTRACT_AND_RUN: "1"
+  # `strip` внутри linuxdeploy старше библиотек современных дистрибутивов и не
+  # понимает секцию `.relr.dyn`, которую делает нынешний компоновщик. Он падает
+  # на каждой такой библиотеке, и сборка AppImage обрывается с невнятным
+  # «failed to run linuxdeploy». Пропуск strip лечит это целиком; цена —
+  # несколько лишних мегабайт в образе.
+  NO_STRIP: "1"
+  GIT_DEPTH: "50"
+
+workflow:
+  rules:
+    # Метка выпуска — единственное, что запускает сборку и публикацию.
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    # Всё прочее пайплайна не заводит: двойные прогоны на ветку и на MR — шум.
+
+default:
+  interruptible: true
+
+# Общий образ для всего, что трогает Rust и Tauri. Зависимости ставятся
+# каждый раз: свой образ в реестре быстрее, но это отдельная задача, а
+# лишний шаг в начале честнее, чем образ, о котором никто не помнит.
+.linux-toolchain:
+  image: rust:1.95-bookworm
+  before_script:
+    - apt-get update
+    - >
+      apt-get install -y --no-install-recommends
+      libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+      libxdo-dev libssl-dev build-essential file wget curl ca-certificates
+      gnupg python3
+    - curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+    - apt-get install -y --no-install-recommends nodejs
+    # Версия pnpm объявлена в package.json (packageManager) — здесь её нет
+    # намеренно: два места означают расхождение.
+    - corepack enable
+    - export PATH="$PNPM_HOME:$PATH"
+    - pnpm install --frozen-lockfile
+  cache:
+    # Ключ по замкам: меняются зависимости — меняется кэш, и старый не мешает.
+    key:
+      files:
+        - pnpm-lock.yaml
+        - src-tauri/Cargo.lock
+    paths:
+      - .cargo/registry/index
+      - .cargo/registry/cache
+      - .pnpm/store
+    # src-tauri/target намеренно НЕ кэшируется: тесты собираются профилем
+    # debug, релиз — профилем release, и один другому не помогает. Гонять
+    # ради этого гигабайты в обе стороны дороже, чем пересобрать.
+
+# ---------------------------------------------------------------- проверки
+
+versions:
+  stage: checks
+  image: debian:bookworm-slim
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends python3
+  script:
+    # На метке сверяем ещё и с ней: v0.2.0 на коде 0.1.9 — обычная ошибка
+    # спешки, и стоит она выпущенного пакета с чужим номером.
+    - ./scripts/check-versions.sh ${CI_COMMIT_TAG:-}
+
+test:desktop:
+  extends: .linux-toolchain
+  stage: checks
+  script:
+    - pnpm lint
+    # vue-tsc внутри build: типы проверяются ровно тем, чем собирается.
+    - pnpm build
+    - cd src-tauri && cargo test --locked --workspace
+
+# ------------------------------------------------------------------ сборка
+
+build:linux:
+  extends: .linux-toolchain
+  stage: build
+  needs: [versions, test:desktop]
+  rules:
+    - if: $CI_COMMIT_TAG
+  timeout: 1h 30m
+  script:
+    - export VERSION=${CI_COMMIT_TAG#v}
+    # Куда файлы лягут ВНУТРИ GitLab — это хранилище пайплайна.
+    - export PKG_BASE="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/darwaza/$VERSION"
+    # А откуда их будут скачивать ЛЮДИ — это другое место, и по умолчанию
+    # оно не совпадает. Репозиторий закрытый, значит и реестр закрыт: ссылка
+    # на него потребует входа, и посторонний по ней не скачает ничего.
+    # DOWNLOAD_BASE_URL задаётся переменной проекта (Settings → CI/CD →
+    # Variables) и указывает на публичную витрину выпусков, например
+    #   https://github.com/ВЛАДЕЛЕЦ/darwaza/releases/download/$CI_COMMIT_TAG
+    # Ссылки верны с той минуты, как файлы там окажутся, — неважно, положил
+    # их пайплайн, выкладка или человек руками.
+    - export PUBLIC_BASE="${DOWNLOAD_BASE_URL:-$PKG_BASE}"
+    - |
+      if [ -z "${DOWNLOAD_BASE_URL:-}" ]; then
+        echo "ВНИМАНИЕ: DOWNLOAD_BASE_URL не задана."
+        echo "releases.json будет указывать на закрытый реестр GitLab —"
+        echo "по этим ссылкам посторонний скачать НЕ сможет."
+      fi
+    # Подпись обновлений (#164). Без ключа сборка проходит, но обновиться по
+    # ней будет нельзя: приложение проверяет подпись и подменённый файл
+    # отвергает. Ключ задаётся переменной проекта TAURI_SIGNING_PRIVATE_KEY;
+    # молчать о его отсутствии нельзя — иначе выпуск выйдет без обновлений, и
+    # выяснится это у людей.
+    - |
+      if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+        echo "ВНИМАНИЕ: TAURI_SIGNING_PRIVATE_KEY не задан."
+        echo "Сборка не будет подписана, и авто-обновление на неё не сработает."
+      fi
+    - pnpm tauri build
+    - ./scripts/release-manifest.sh "$VERSION" "$PUBLIC_BASE" dist-release
+    # Проверка releases.json схемой контракта живёт в репозитории server —
+    # там, где сама схема и эндпоинт, который этот файл читает. Тащить схему
+    # сюда значило бы завести её копию, а копия расходится молча. Проверка
+    # делается на стороне сервера перед тем, как файл начнёт отдаваться
+    # витриной (docs/07-release/ci.md).
+    - ./scripts/release-notes.sh "$VERSION" > dist-release/release-notes.md
+    # Имена файлов заранее не известны — их подставляет сборщик. Передаём
+    # готовые ссылки следующим шагам, чтобы те не гадали.
+    - |
+      {
+        echo "VERSION=$VERSION"
+        echo "PKG_BASE=$PKG_BASE"
+        echo "PUBLIC_BASE=$PUBLIC_BASE"
+        echo "DEB_URL=$(python3 -c "import json;print([a['url'] for a in json.load(open('dist-release/releases.json'))['assets'] if a['kind']=='deb'][0])")"
+        echo "RPM_URL=$(python3 -c "import json;print([a['url'] for a in json.load(open('dist-release/releases.json'))['assets'] if a['kind']=='rpm'][0])")"
+        echo "APPIMAGE_URL=$(python3 -c "import json;print([a['url'] for a in json.load(open('dist-release/releases.json'))['assets'] if a['kind']=='AppImage'][0])")"
+        echo "SUMS_URL=$PUBLIC_BASE/SHA256SUMS"
+        echo "MANIFEST_URL=$PUBLIC_BASE/releases.json"
+      } > release.env
+  artifacts:
+    name: "darwaza-$CI_COMMIT_TAG"
+    paths:
+      - dist-release/
+    reports:
+      dotenv: release.env
+    expire_in: never
+
+# ------------------------------------------------------- Windows и macOS
+
+# Обе системы собираются ТОЛЬКО на своих машинах. Кросс-сборка из Linux не
+# годится в принципе: Tauri берёт системный вебвью — WebView2 на Windows и
+# WKWebView на macOS, — а его нет в кросс-окружении. Поэтому здесь нужны
+# отдельные раннеры.
+#
+# Раннеры GitLab SaaS для Windows и macOS ПЛАТНЫЕ и включаются владельцем в
+# настройках проекта. Пока они не включены, оба задания просто не запустятся,
+# и Linux-выпуск от этого не пострадает — `allow_failure` ниже ровно об этом.
+#
+# Пока раннеров нет, собрать можно руками на своей машине той же командой
+# `pnpm tauri build`; файлы кладутся в тот же bundle, и общий манифест их
+# подхватит (scripts/release-manifest.sh).
+
+build:windows:
+  stage: build
+  needs: [versions, test:desktop]
+  rules:
+    - if: $CI_COMMIT_TAG
+  # Задание не должно валить выпуск: Linux — целевая система, Windows пока нет.
+  allow_failure: true
+  timeout: 1h 30m
+  tags:
+    - saas-windows-medium-amd64
+  variables:
+    # MSVC, а не GNU: WebView2 и подписывание работают только с ним.
+    RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-msvc
+  before_script:
+    - choco install -y rustup.install --no-progress
+    - rustup default $env:RUSTUP_TOOLCHAIN
+    - corepack enable
+    - pnpm install --frozen-lockfile
+  script:
+    # Даёт .msi и установщик NSIS (.exe). Оба идут на витрину: msi ставится
+    # политиками в организациях, exe привычнее человеку.
+    - pnpm tauri build
+  artifacts:
+    name: "darwaza-windows-$CI_COMMIT_TAG"
+    paths:
+      - src-tauri/target/release/bundle/msi/
+      - src-tauri/target/release/bundle/nsis/
+    expire_in: never
+
+build:macos:
+  stage: build
+  needs: [versions, test:desktop]
+  rules:
+    - if: $CI_COMMIT_TAG
+  allow_failure: true
+  timeout: 1h 30m
+  tags:
+    - saas-macos-medium-m1
+  before_script:
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    - source "$HOME/.cargo/env"
+    - corepack enable
+    - pnpm install --frozen-lockfile
+  script:
+    # Сборка под оба процессора: Apple Silicon и Intel. Одного мало —
+    # на чужой машине приложение просто не запустится.
+    - rustup target add aarch64-apple-darwin x86_64-apple-darwin
+    - pnpm tauri build --target universal-apple-darwin
+  artifacts:
+    name: "darwaza-macos-$CI_COMMIT_TAG"
+    paths:
+      - src-tauri/target/universal-apple-darwin/release/bundle/dmg/
+    expire_in: never
+  # ВНИМАНИЕ: сборка НЕ подписана. macOS покажет «программу нельзя открыть,
+  # так как её автор не установлен», и обойти это человек сможет только через
+  # системные настройки. Подпись требует платного Apple Developer ID и
+  # заверения у Apple; переменные APPLE_CERTIFICATE, APPLE_SIGNING_IDENTITY,
+  # APPLE_ID и APPLE_PASSWORD задаются владельцем в настройках проекта, и
+  # Tauri подхватывает их сам. Молчать об этом нельзя: неподписанная сборка
+  # выглядит для человека как сломанная.
+
+# --------------------------------------------------------------- публикация
+
+publish:packages:
+  stage: publish
+  image: curlimages/curl:latest
+  needs:
+    - job: build:linux
+      artifacts: true
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    # Реестр пакетов, а не «просто артефакты задания»: у артефактов есть срок
+    # и путь через веб-интерфейс, а ссылку в релизе мы даём людям надолго.
+    - |
+      for file in dist-release/*; do
+        name=$(basename "$file")
+        echo "Загружаю $name"
+        curl --fail-with-body --silent --show-error \
+          --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+          --upload-file "$file" \
+          "$PKG_BASE/$name"
+        echo
+      done
+
+# Публичная витрина: GitHub Releases (#166).
+#
+# Репозиторий кода в GitLab закрытый, значит и реестр пакетов закрыт: ссылка на
+# него потребует входа, и посторонний по ней не скачает ничего. Поэтому файлы
+# дублируются в публичный репозиторий на GitHub — там они и лежат для людей, и
+# оттуда же берёт их витрина по DOWNLOAD_BASE_URL.
+#
+# Нужны две переменные проекта (Settings → CI/CD → Variables):
+#   GITHUB_TOKEN — токен с правом `contents: write` в публичном репозитории,
+#                  «Masked» и «Protected»;
+#   GITHUB_REPO  — «владелец/репозиторий», например `ikhasanmusaev/darwaza`.
+#
+# Без них задание не падает, а сообщает и пропускается: Linux-выпуск не должен
+# срываться из-за витрины, но и молчать об этом нельзя — иначе ссылки в
+# releases.json окажутся ведущими в никуда, и узнают об этом посетители.
+publish:github:
+  stage: publish
+  image: alpine:latest
+  needs:
+    - job: build:linux
+      artifacts: true
+  rules:
+    - if: $CI_COMMIT_TAG
+  allow_failure: true
+  before_script:
+    - apk add --no-cache curl jq
+  script:
+    - |
+      if [ -z "${GITHUB_TOKEN:-}" ] || [ -z "${GITHUB_REPO:-}" ]; then
+        echo "GITHUB_TOKEN или GITHUB_REPO не заданы — выкладка на витрину пропущена."
+        echo "Файлы останутся только в закрытом реестре GitLab, и ссылки в"
+        echo "releases.json будут требовать входа. Задайте переменные проекта."
+        exit 0
+      fi
+    - |
+      api="https://api.github.com/repos/$GITHUB_REPO"
+      auth="Authorization: Bearer $GITHUB_TOKEN"
+
+      # Релиз может уже существовать — например, если задание перезапустили.
+      # Тогда переиспользуем его, а не плодим второй с тем же именем.
+      id=$(curl --silent --header "$auth" "$api/releases/tags/$CI_COMMIT_TAG" | jq -r '.id // empty')
+      if [ -z "$id" ]; then
+        id=$(curl --fail-with-body --silent --show-error --request POST \
+          --header "$auth" --header "Content-Type: application/json" \
+          --data "$(jq -n --arg tag "$CI_COMMIT_TAG" \
+                      --rawfile body dist-release/release-notes.md \
+                      '{tag_name: $tag, name: $tag, body: $body}')" \
+          "$api/releases" | jq -r '.id')
+      fi
+      [ -n "$id" ] || { echo "не удалось создать релиз на GitHub" >&2; exit 1; }
+
+      for file in dist-release/*; do
+        name=$(basename "$file")
+        echo "Выкладываю $name"
+        # Существующий файл с тем же именем удаляем: GitHub не заменяет их
+        # молча, а отвечает отказом, и повтор задания срывался бы на первом же.
+        old=$(curl --silent --header "$auth" "$api/releases/$id/assets" \
+              | jq -r --arg n "$name" '.[] | select(.name == $n) | .id')
+        [ -n "$old" ] && curl --silent --request DELETE --header "$auth" "$api/releases/assets/$old"
+
+        curl --fail-with-body --silent --show-error --request POST \
+          --header "$auth" --header "Content-Type: application/octet-stream" \
+          --data-binary "@$file" \
+          "https://uploads.github.com/repos/$GITHUB_REPO/releases/$id/assets?name=$name" > /dev/null
+      done
+      echo "Выложено на https://github.com/$GITHUB_REPO/releases/tag/$CI_COMMIT_TAG"
+
+# ------------------------------------------------------------------- релиз
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - job: build:linux
+      artifacts: true
+    - job: publish:packages
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - echo "Релиз Darwaza $VERSION"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: "Darwaza $VERSION"
+    description: dist-release/release-notes.md
+    assets:
+      links:
+        - name: "Debian, Ubuntu, Mint — .deb"
+          url: $DEB_URL
+          link_type: package
+        - name: "Fedora, RHEL, openSUSE — .rpm"
+          url: $RPM_URL
+          link_type: package
+        - name: "Любой дистрибутив — AppImage"
+          url: $APPIMAGE_URL
+          link_type: package
+        - name: "Контрольные суммы — SHA256SUMS"
+          url: $SUMS_URL
+          link_type: other
+        - name: "Список сборок для витрины — releases.json"
+          url: $MANIFEST_URL
+          link_type: other

@@ -1,0 +1,62 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Darwaza",
+  "version": "0.1.0",
+  "identifier": "dev.darwaza.app",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Darwaza",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://darwaza.uz/updates/{{target}}/{{arch}}/{{current_version}}"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3QkJBNTMzNEE2OTM5MjcKUldRbk9XbEtNNlc3UjBTYTBzOTlQR2daUDdHRVhhREtyWEticEsyM1VOd3FBMFhzMlV6WlRmOHoK",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "shortDescription": "SSH-клиент с менеджером хостов и терминалом",
+    "longDescription": "Darwaza — SSH-клиент, работающий локально. Менеджер хостов и групп, терминал с вкладками, SFTP, проброс портов, сниппеты, импорт ~/.ssh/config и known_hosts.\nПароли и ключи хранятся в системном keyring, при желании под мастер-паролем. Приложение полностью работает без учётной записи и без сети: учётная запись нужна только для синхронизации между устройствами, и сервер не может прочитать её содержимое.",
+    "category": "DeveloperTool",
+    "targets": "all",
+    "icon": [
+      "icons/icon.png",
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    }
+  }
+}

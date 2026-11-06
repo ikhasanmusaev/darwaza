@@ -1,0 +1,126 @@
+[package]
+name = "darwaza"
+# Программ в пакете две: само приложение и посредник для агента. Без этой
+# строки `cargo run` не знает, какую запускать, и падает — а `tauri dev`
+# зовёт именно его.
+default-run = "darwaza"
+version = "0.1.0"
+description = "Darwaza — local-first SSH client"
+authors = ["Khasan Musaev <hm.musaev@gmail.com>"]
+edition = "2021"
+
+[lib]
+name = "darwaza_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri core
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database (SQLite)
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# SSH and PTY
+russh = "0.52"
+portable-pty = "0.9"
+
+# System keyring
+# ВАЖНО: не "linux-native" в одиночку. Это керниловый keyutils — память ядра,
+# которая не переживает перезагрузку и не видна системному хранилищу. Пароли
+# из неё пропадали сами, а человек видел «no password stored for identity N»
+# и думал, что не сохранил (2026-08-28).
+#
+# linux-native-sync-persistent = keyutils как быстрый кэш + Secret Service
+# (KWallet/GNOME Keyring) как постоянное хранилище. Именно это и обещано в
+# документации и на витрине: «секреты в системном keyring».
+# Общая часть без бэкендов: бэкенд выбирается по платформе ниже.
+keyring = { version = "3.6" }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Misc
+directories = "5.0"            # platform dirs (XDG_DATA_HOME etc.)
+once_cell = "1.20"             # lazy statics
+async-trait = "0.1"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+russh-sftp = "2.3.0"
+argon2 = "0.5.3"
+aes-gcm = "0.11.0"
+zeroize = "1.9.0"
+base64 = "0.23.0"
+getrandom = "0.4.3"
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+# Нормализация пароля по RFC 8265. Была в dev-зависимостях, пока
+# спецификация жила только в тесте.
+unicode-normalization = "0.1.25"
+reqwest = { version = "0.13.4", default-features = false, features = ["native-tls", "json"] }
+tauri-plugin-updater = "2"
+tauri-plugin-notification = "2"
+
+[profile.dev]
+# Отладочная информация — основной вес каталога сборки: он разрастался до
+# 11 ГБ и трижды за сессию упирался в свободное место на диске.
+#
+# "line-tables-only" оставляет в бэктрейсах файлы и номера строк — то есть
+# всё, что реально читают при разборе паники, — но выбрасывает описания
+# типов, ради которых и копятся гигабайты. Пошаговая отладка отладчиком
+# при этом станет беднее; если она понадобится, значение возвращается
+# на `true` одной строкой.
+debug = "line-tables-only"
+
+# Отладочная информация лежит отдельными файлами, а не внутри объектных:
+# перелинковка перестаёт копировать её каждый раз.
+split-debuginfo = "unpacked"
+
+# ── Хранилище секретов по платформам (#160, #161) ────────────────────────
+#
+# Фича keyring выбирает бэкенд, и одной общей для всех систем не бывает:
+# `linux-native-sync-persistent` тянет Secret Service и не собирается под
+# Windows и macOS. Раньше она стояла общей, и сборка под эти системы падала
+# бы на первом же `cargo build` — просто никто не пробовал.
+
+# Нужен тестам прав доступа: проверить 0600 можно, только сбросив umask.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Подсветка кнопки в панели задач KDE и критичное уведомление (#252): плагин
+# уведомлений не умеет ни срочности, ни desktop-entry. Версия та же, что у плагина.
+zbus = "5"
+# keyutils как быстрый кэш + Secret Service (KWallet/GNOME Keyring) как
+# постоянное хранилище. НЕ "linux-native" в одиночку: это только память ядра,
+# которая не переживает перезагрузку и не видна системе. Пароли из неё
+# пропадали сами, а человек видел «no password stored» и думал, что не
+# сохранил (2026-08-28).
+keyring = { version = "3.6", features = ["linux-native-sync-persistent"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Windows Credential Manager — часть системы, ставить и настраивать нечего.
+keyring = { version = "3.6", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Keychain — то же самое на macOS.
+keyring = { version = "3.6", features = ["apple-native"] }
+
+[dev-dependencies]

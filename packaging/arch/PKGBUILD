@@ -1,0 +1,88 @@
+# Maintainer: Khasan Musaev <hm.musaev@gmail.com>
+#
+# Пакет для Arch и Manjaro (#167).
+#
+# Собирается из локального дерева исходников — того самого, в котором лежит
+# этот файл. Публичного репозитория у проекта пока нет, и PKGBUILD, тянущий
+# исходники из сети, ссылался бы в пустоту.
+#
+# Сборка и установка:
+#   cd packaging/arch && makepkg -si
+#
+# Если Rust и pnpm поставлены не пакетами, а через rustup и corepack — как на
+# машине разработчика, — makepkg их не увидит и откажется начинать. Это не
+# ошибка PKGBUILD: список makedepends правильный для чистой системы и для AUR.
+# В таком случае:
+#   makepkg -si --nodeps
+#
+# Когда появится публичный репозиторий, здесь меняются `source` и `sha256sums`
+# — остальное остаётся как есть.
+
+pkgname=darwaza
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="SSH-клиент с менеджером хостов и терминалом, работающий локально"
+arch=('x86_64')
+url="https://darwaza.uz"
+license=('MIT')
+
+# webkit2gtk-4.1 и gtk3 нужны самому Tauri: интерфейс рисует системный вебвью.
+# libsecret — системное хранилище секретов; без него приложение работает, но
+# предложит мастер-пароль (#169–#171).
+depends=('webkit2gtk-4.1' 'gtk3' 'libsecret' 'openssl')
+makedepends=('rust' 'cargo' 'nodejs' 'pnpm' 'git')
+options=('!lto')
+
+# Исходники берутся из дерева, а не скачиваются.
+source=()
+sha256sums=()
+
+_root="$(cd "$startdir/../.." && pwd)"
+
+prepare() {
+  cd "$_root"
+  pnpm install --frozen-lockfile
+}
+
+build() {
+  cd "$_root"
+  # Именно `tauri build`, а не `cargo build --release`: последний собирает
+  # приложение с настройкой разработки, которое ищет интерфейс на
+  # localhost:1420 и без dev-сервера показывает белый экран.
+  pnpm tauri build --bundles deb
+}
+
+check() {
+  cd "$_root/src-tauri"
+  # Именно `--release`, и это не про скорость. `build()` выше уже собрал всё в
+  # release; отладочный прогон компилировал бы весь проект второй раз, в другой
+  # профиль — это 6,5 ГБ на диске сверх release. Проверено на своей шкуре:
+  # сборка падала с «No space left on device» посреди check().
+  #
+  # Живые тесты пропускаются сами: они помечены `#[ignore]`, им нужен
+  # настоящий сервер.
+  cargo test --release --quiet
+}
+
+package() {
+  # Раскладку берём из готового deb, чтобы она не разъехалась с остальными
+  # пакетами: там она уже описана Tauri и проверена.
+  # Каталог сборки Rust может быть перенесён: у разработчика он вынесен в
+  # /var/tmp через src-tauri/.cargo/config.toml, потому что раздел с домашним
+  # каталогом маленький, а target разрастается до гигабайтов. Поэтому ищем в
+  # обоих местах, а не полагаемся на одно.
+  local data target
+  for target in "${CARGO_TARGET_DIR:-}" \
+                "$(sed -n 's/^ *target-dir *= *"\(.*\)"/\1/p' "$_root/src-tauri/.cargo/config.toml" 2>/dev/null)" \
+                "$_root/src-tauri/target"; do
+    [ -n "$target" ] || continue
+    data="$(find "$target/release/bundle/deb" -maxdepth 2 -type d -name data 2>/dev/null | head -1)"
+    [ -n "$data" ] && break
+  done
+  [ -n "$data" ] || { echo "не найден распакованный deb — сборка не дала пакета" >&2; return 1; }
+
+  cp -a "$data/usr" "$pkgdir/usr"
+
+  # README в репозитории кода нет — документация вынесена в отдельный каталог
+  # (см. START-HERE.md). Пустой каталог doc/ в пакете не нужен.
+}

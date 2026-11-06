@@ -1,0 +1,79 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Dependencies
+node_modules
+src-tauri/target
+# Местная настройка: куда складывать сборку (путь машины, не проекта)
+src-tauri/.cargo/
+
+# Build
+dist
+dist-ssr
+*.local
+
+# Собранные пакеты и описание релиза — их делает пайплайн, в репозитории им
+# не место (docs/07-release/ci.md)
+dist-release
+release.env
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+
+# Local SQLite cache for sqlx prepare
+src-tauri/.sqlx/
+
+# Local DB used in dev (separate from production data dir)
+src-tauri/dev-data/
+
+# Секреты окружения сервера
+server/.env
+
+# Письма разработки: одноразовые ссылки, не для репозитория
+server/.mail-outbox/
+
+# Письма e2e
+web/tests/e2e/.outbox/
+web/test-results/
+web/playwright-report/
+
+# Итоги прогонов Playwright в корне — мусор прогона, не результат работы
+test-results/
+playwright-report/
+
+# Предпросмотры витрины из отладочных прогонов
+landing/tests/e2e/.preview-*.png
+landing/test-results/
+landing/playwright-report/
+
+# Документация — соседний репозиторий (../darwaza-docs), здесь на неё ссылки.
+docs/
+/CLAUDE.md
+/KIMI.md
+/TASKS.md
+/README.md
+
+# Настройка субагентов — местная настройка инструмента, не версионируется
+# нигде: ни здесь, ни в документации. Решение владельца 2026-08-27.
+/.claude/agents
+/.kimi/agents
+/START-HERE.md
