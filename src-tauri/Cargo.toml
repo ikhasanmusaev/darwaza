@@ -7,7 +7,7 @@ default-run = "darwaza"
 version = "0.1.1"
 description = "Darwaza — local-first SSH client"
 license = "GPL-3.0-or-later"
-authors = ["Khasan Musaev <hm.musaev@gmail.com>"]
+authors = ["Khasan Musaev <contact@darwaza.uz>"]
 edition = "2021"
 
 [lib]

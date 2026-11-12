@@ -32,6 +32,23 @@ them**, so a reinstall finds your hosts again. For a complete removal, delete bo
 folders by hand after uninstalling. Passwords and key passphrases are kept in Windows
 Credential Manager (entries named `darwaza`); remove them there if you want them gone.
 
+## SFTP is still rough
+
+File transfer works, but it is not comfortable yet, and we know it. Next releases
+will bring:
+
+- asking what to do when a file with the same name exists: replace, skip or rename;
+- deleting a folder with everything inside, after a confirmation;
+- selecting several files at once;
+- an editable path bar and sorting by name, size and date;
+- changing permissions (chmod);
+- editing a server file in your own editor;
+- the file panel following the terminal's current folder;
+- reconnecting after a dropped connection, folder bookmarks;
+- transfer speed and time left.
+
+If something gets in your way, open an issue: it helps us choose what to do first.
+
 ## Build from source
 
 You need Rust (stable), Node.js 22, [pnpm](https://pnpm.io) and the system

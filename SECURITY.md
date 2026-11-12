@@ -1,13 +1,13 @@
 # Security policy
 
-> **Draft.** The reporting address and response times below are placeholders until the
-> maintainer confirms them.
+> **Draft.** The response times below are placeholders until the maintainer confirms
+> them.
 
 ## Reporting a vulnerability
 
 Please **do not open a public issue** for a security problem. Write privately to:
 
-**hm.musaev@gmail.com**
+**security@darwaza.uz**
 
 Include what you found, how to reproduce it, the version (*Settings → About*) and, if you
 can, the impact. You do not need to have a fix.
