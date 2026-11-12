@@ -1,0 +1,173 @@
+# Сборка Darwaza для macOS: подпись Developer ID, заверение у Apple, выкладка в выпуск.
+#
+# Linux и Windows собирает GitLab (.gitlab-ci.yml) и сам создаёт выпуск здесь, на
+# GitHub. Mac собирается тут: у GitHub для открытых репозиториев есть машины
+# с macOS бесплатно, а у GitLab — только платные.
+#
+# Когда запускается:
+#   - сам, когда GitLab опубликовал выпуск vX.Y.Z: собирает код этой метки и
+#     дописывает Mac в файлы выпуска (releases.json, latest.json, SHA256SUMS);
+#   - руками (Actions → macOS → Run workflow):
+#       метка пустая  — проверочная сборка ветки по умолчанию, файлы только в
+#                       артефактах задания, выпуск не трогается;
+#       метка vX.Y.Z  — то же, что после выпуска (например, если GitLab
+#                       перевыложил свои файлы и записи Mac пропали).
+#
+# Секреты (Settings → Secrets and variables → Actions) — без них сборка не идёт:
+#   APPLE_CERTIFICATE           .p12 сертификата Developer ID в base64
+#   APPLE_CERTIFICATE_PASSWORD  пароль к .p12
+#   APPLE_SIGNING_IDENTITY      «Developer ID Application: Имя (TEAMID)»
+#   APPLE_API_ISSUER            Issuer ID ключа App Store Connect
+#   APPLE_API_KEY               Key ID этого ключа
+#   APPLE_API_KEY_P8            содержимое AuthKey_<KeyID>.p8
+#   TAURI_SIGNING_PRIVATE_KEY   ключ подписи обновлений (тот же, что в GitLab)
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  пароль к нему, если он есть
+name: macOS
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Метка выпуска vX.Y.Z. Пусто — проверочная сборка без выкладки"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-${{ github.event.release.tag_name || inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Пробные метки vX.Y.Z-rcN GitLab на витрину не выкладывает — и мы не собираем.
+    if: ${{ github.event_name != 'release' || !contains(github.event.release.tag_name, '-rc') }}
+    runs-on: macos-14
+    timeout-minutes: 90
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      BUNDLE: src-tauri/target/universal-apple-darwin/release/bundle
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag || github.ref }}
+
+      - name: Секреты на месте
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          missing=""
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                      APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_P8 TAURI_SIGNING_PRIVATE_KEY; do
+            [ -n "${!name}" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Не заданы секреты:$missing. Неподписанная сборка для Mac выглядит сломанной — не собираю."
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: pnpm из packageManager
+        run: corepack enable && pnpm --version
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Ключ App Store Connect в файл
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          umask 077
+          printf '%s\n' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+          echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
+
+      # Tauri сам заводит временную связку ключей с сертификатом, подписывает
+      # приложение (hardened runtime), отправляет его Apple и прикрепляет ответ.
+      - name: Сборка, подпись и заверение
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build --target universal-apple-darwin
+
+      - name: Ключ App Store Connect убрать
+        if: always()
+        run: rm -f "$RUNNER_TEMP/AuthKey.p8"
+
+      # Зелёная сборка ещё не значит, что Mac её откроет. Проверяем то же, что
+      # проверит Gatekeeper у человека: оба процессора, подпись, заверение.
+      - name: Проверка подписи и заверения
+        run: |
+          app="$BUNDLE/macos/Darwaza.app"
+          for bin in darwaza darwaza-mcp; do
+            lipo "$app/Contents/MacOS/$bin" -verify_arch arm64 x86_64 \
+              || { echo "::error::$bin собран не под оба процессора"; exit 1; }
+          done
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv "$app" 2>&1 | grep -E "Authority=Developer ID Application|TeamIdentifier"
+          spctl --assess --type execute --verbose=4 "$app"
+          xcrun stapler validate "$app"
+
+      - name: Файлы для выпуска
+        run: |
+          version=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          if [ -n "$TAG" ] && [ "v$version" != "$TAG" ]; then
+            echo "::error::Метка $TAG, а версия в tauri.conf.json — $version"
+            exit 1
+          fi
+          mkdir -p out
+          cp "$BUNDLE/dmg/Darwaza_${version}_universal.dmg" out/
+          # Имя архива обновления с версией: в выпуске лежат файлы разных
+          # систем, и безымянный Darwaza.app.tar.gz было бы не отличить.
+          cp "$BUNDLE/macos/Darwaza.app.tar.gz" "out/Darwaza_${version}_universal.app.tar.gz"
+          cp "$BUNDLE/macos/Darwaza.app.tar.gz.sig" "out/Darwaza_${version}_universal.app.tar.gz.sig"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darwaza-macos-${{ env.VERSION }}
+          path: out/
+          if-no-files-found: error
+
+      - name: Дописать Mac в выпуск
+        if: env.TAG != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Файлы выпуска, которые сделал GitLab. Каких нет — скрипт создаст.
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D out \
+            -p releases.json -p latest.json -p SHA256SUMS || true
+          python3 scripts/release-add-macos.py "$TAG" \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG" out
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber \
+            out/Darwaza_${VERSION}_universal.dmg \
+            out/Darwaza_${VERSION}_universal.app.tar.gz \
+            out/Darwaza_${VERSION}_universal.app.tar.gz.sig \
+            out/releases.json out/latest.json out/SHA256SUMS
+          echo "Готово. releases.json и latest.json с Mac — в выпуске $TAG;"
+          echo "на сервер их кладут так же, как после выпуска Linux (docs/07-release/ci.md, шаг 8)."
