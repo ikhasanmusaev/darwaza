@@ -41,7 +41,10 @@ export const transfersApi = {
     isDir: boolean,
     target: TreeEndpoint,
     targetDir: string,
-  ) => invoke<string>("transfer_tree", { source, sourcePath, isDir, target, targetDir }),
+    /** Одноимённое на месте назначения: `rename` — положить рядом (по умолчанию), `replace` — заменить. */
+    onConflict: "rename" | "replace" = "rename",
+  ) =>
+    invoke<string>("transfer_tree", { source, sourcePath, isDir, target, targetDir, onConflict }),
   /** `false` — передача уже завершилась. */
   cancel: (id: string) => invoke<boolean>("transfer_cancel", { id }),
   downloadDir: () => invoke<string>("transfers_download_dir"),

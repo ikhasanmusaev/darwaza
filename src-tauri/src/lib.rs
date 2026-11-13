@@ -1,4 +1,5 @@
 pub mod agent;
+mod app_menu;
 mod attention;
 mod commands;
 mod connection_log;
@@ -70,9 +71,16 @@ async fn start_agent_channel(handle: &tauri::AppHandle) {
 }
 
 /// Каталог для логов: предпочтение XDG_STATE_HOME, иначе data_dir.
+///
+/// Закрыт от других пользователей компьютера: в журнале имена хостов, адреса
+/// и пути. Закрыт и сам каталог состояния — там же токен агента и отчёты о
+/// сбоях. Журнал ещё не запущен, поэтому неудача здесь молчит: без закрытого
+/// каталога журнал не пишем вовсе, только в stderr.
 fn log_dir() -> Option<PathBuf> {
-    let dir = paths::state_dir().ok()?.join("log");
-    std::fs::create_dir_all(&dir).ok()?;
+    let state = paths::state_dir().ok()?;
+    paths::ensure_private_dir(&state).ok()?;
+    let dir = state.join("log");
+    paths::ensure_private_tree(&dir).ok()?;
     Some(dir)
 }
 
@@ -179,7 +187,7 @@ pub fn run() {
     #[cfg(target_os = "linux")]
     ensure_software_gl_fallback();
 
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         // Проверка обновлений (#164). Плагин ничего не делает сам: он даёт
         // команду, которую зовёт интерфейс по кнопке. Автоматическая проверка
@@ -187,7 +195,11 @@ pub fn run() {
         // без сети, и лезть в неё без спроса ему незачем.
         .plugin(tauri_plugin_updater::Builder::new().build())
         // Уведомление «ждут решения» (#252): текст без деталей, см. attention.rs.
-        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_notification::init());
+    // ⌘W на Mac должен закрывать вкладку, а не окно: см. app_menu.rs.
+    #[cfg(target_os = "macos")]
+    let builder = builder.menu(app_menu::build);
+    let app = builder
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Focused(true) = event {
                 attention::clear(window.app_handle());
@@ -322,11 +334,14 @@ pub fn run() {
             commands::sftp_rename,
             commands::sftp_download,
             commands::sftp_upload,
+            commands::sftp_put_clipboard_image,
             commands::sftp_close,
             commands::local_home,
             commands::local_parent,
             commands::local_list,
             commands::clipboard::clipboard_read_text,
+            commands::clipboard::clipboard_write_text,
+            commands::clipboard::clipboard_read_image,
             commands::local_mkdir,
             commands::local_rename,
             commands::local_remove,

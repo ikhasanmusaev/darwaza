@@ -12,6 +12,7 @@ import {
 import { useSessionsStore } from "../stores/sessions";
 import { useLayoutStore } from "../stores/layout";
 import { errorText } from "../lib/errors";
+import { shortcutLabel } from "../lib/platform";
 
 /**
  * Контекстное меню вкладки (правая кнопка, Shift+F10 или клавиша меню).
@@ -86,7 +87,7 @@ async function split(dir: "row" | "column") {
             @select="split('row')"
           >
             {{ t("tabMenu.splitRight") }}
-            <span class="menu-hint">Ctrl+Shift+D</span>
+            <span class="menu-hint">{{ shortcutLabel("Shift", "D") }}</span>
           </ContextMenuItem>
           <ContextMenuItem
             data-testid="tab-menu-split-column"
@@ -96,7 +97,7 @@ async function split(dir: "row" | "column") {
             @select="split('column')"
           >
             {{ t("tabMenu.splitDown") }}
-            <span class="menu-hint">Ctrl+Shift+E</span>
+            <span class="menu-hint">{{ shortcutLabel("Shift", "E") }}</span>
           </ContextMenuItem>
           <ContextMenuItem
             v-if="isDead"
@@ -113,7 +114,7 @@ async function split(dir: "row" | "column") {
             @select="run(() => store.close(sessionId!))"
           >
             {{ t("tabMenu.close") }}
-            <span class="menu-hint">Ctrl+W</span>
+            <span class="menu-hint">{{ shortcutLabel("W") }}</span>
           </ContextMenuItem>
           <ContextMenuItem
             data-testid="tab-menu-close-others"

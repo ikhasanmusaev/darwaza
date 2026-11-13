@@ -17,11 +17,14 @@ import {
   Trash2,
 } from "lucide-vue-next";
 import { errorText } from "../lib/errors";
-import { readClipboardText } from "../api/clipboard";
+import { readClipboardImage, readClipboardText, writeClipboardText } from "../api/clipboard";
+import { sftpApi } from "../api/sftp";
+import { parseOsc52 } from "../lib/osc52";
 import { useSessionsStore } from "../stores/sessions";
 import { useSettingsStore } from "../stores/settings";
 import { useBookmarksStore } from "../stores/bookmarks";
 import { getTheme } from "../lib/terminal-themes";
+import { isAppMod, isMacOS } from "../lib/platform";
 import "xterm/css/xterm.css";
 
 const props = defineProps<{ sessionId: string }>();
@@ -35,6 +38,8 @@ const container = ref<HTMLDivElement | null>(null);
 const reconnecting = ref(false);
 const showSearch = ref(false);
 const searchQuery = ref("");
+/** Что происходит с картинкой из буфера: идёт передача или она не удалась. */
+const imagePaste = ref<"uploading" | "failed" | null>(null);
 
 const session = computed(() => store.sessions.find((s) => s.sessionId === props.sessionId) ?? null);
 
@@ -147,6 +152,12 @@ function buildTerminal(): Terminal {
     allowProposedApi: true,
     scrollback: 5000,
     theme: termTheme.value,
+    // На macOS Option обязан работать как Meta. Без этого Option+b и Option+f
+    // («слово назад», «слово вперёд» в оболочке) отдают в терминал спецсимвол
+    // вместо ESC-последовательности, и перемещение по словам не работает.
+    // Платой за это становится набор спецсимволов через Option (например,
+    // Option+e для «é») — в терминале он перестаёт работать.
+    macOptionIsMeta: isMacOS(),
   });
   fitAddon = new FitAddon();
   searchAddon = new SearchAddon();
@@ -188,7 +199,7 @@ onMounted(() => {
   function copySelection(): boolean {
     const sel = term?.getSelection();
     if (!sel) return false;
-    navigator.clipboard.writeText(sel).catch(() => undefined);
+    void writeClipboardText(sel);
     // Выделение снимаем: скопированное остаётся подсвеченным и мешает читать
     // вывод, а человек уже считает копирование законченным.
     term?.clearSelection();
@@ -223,6 +234,45 @@ onMounted(() => {
     });
   }
 
+  /**
+   * OSC 52: программа на сервере просит записать текст в буфер. Без этого
+   * копирование в Claude Code на весь экран, tmux и vim с мышью молча пропадало.
+   * Пишем, только пока этот терминал в фокусе: фоновая вкладка или свёрнутое окно
+   * не должны подменять то, что человек скопировал сам.
+   */
+  term.parser.registerOscHandler(52, (data) => {
+    const text = parseOsc52(data);
+    if (text !== null && document.hasFocus() && term?.textarea === document.activeElement) {
+      void writeClipboardText(text);
+    }
+    return true;
+  });
+
+  /**
+   * Голый Ctrl+V. В буфере картинка: кладём её на сервер и вставляем путь,
+   * потому что программа на сервере видит только буфер сервера. Иначе уходит ^V,
+   * как и раньше: текст этим сочетанием не вставляем (решение от 2026-11-02).
+   */
+  async function handleCtrlV() {
+    const image = await readClipboardImage();
+    if (!isInteractive.value) return;
+    if (!image) {
+      store.send(props.sessionId, encoder.encode("\x16")).catch(() => undefined);
+      return;
+    }
+    imagePaste.value = "uploading";
+    try {
+      term?.paste(await sftpApi.putClipboardImage(props.sessionId, image));
+      imagePaste.value = null;
+    } catch (e) {
+      console.warn("картинка из буфера не передана:", e);
+      imagePaste.value = "failed";
+      window.setTimeout(() => {
+        if (imagePaste.value === "failed") imagePaste.value = null;
+      }, 6000);
+    }
+  }
+
   // Copy/paste keyboard (xterm.js v5 пропускает их через customHandlers)
   term.attachCustomKeyEventHandler((e) => {
     if (e.type !== "keydown") return true;
@@ -231,27 +281,47 @@ onMounted(() => {
     // (`e.key`): при кириллической раскладке `key` — «ц», «м», «а», и привязка
     // к латинице молча не срабатывала. Обычный ввод не затронут: везде нужен Ctrl.
 
+    // macOS: Cmd+C копирует выделенное, как во всей системе.
+    //
+    // Само по себе копирование здесь не случилось бы: xterm держит выделение
+    // в своей модели, а не в выделении документа, поэтому системное
+    // «Копировать» в терминале копировать нечего и нажатие доходит до нас.
+    //
+    // При пустом выделении нажатие НЕ перехватываем: оно должно уйти дальше,
+    // иначе системное копирование в полях ввода сломается.
+    //
+    // Cmd+V не перехватываем сознательно: вставку делает сам WebView, а xterm
+    // подхватывает её событием paste — чистит скрытую textarea и шлёт текст
+    // один раз, в скобочной вставке. Своего кода для этого не нужно, и лишний
+    // перехват сломал бы вставку правой кнопкой и из меню приложения.
+    if (isMacOS() && e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && e.code === "KeyC") {
+      if (!copySelection()) return true;
+      e.preventDefault();
+      e.stopPropagation();
+      return false;
+    }
+
     // Голый Ctrl+C не перехватывается — решение владельца (2026-08-31): он
     // обязан прерывать команду, и подменять его копией значит отнимать у
     // человека единственный способ остановить зависший процесс. Копия и
     // вставка живут на Ctrl+Shift+C и Ctrl+Shift+V — так принято в терминалах.
     //
-    // Голый Ctrl+V (решение владельца, 2026-11-02) ничего не вставляет: в
-    // оболочку уходит ^V (0x16, «quoted-insert»). WebKitGTK при этом запускал
-    // ещё и собственную вставку, поэтому её гасим — как и у Ctrl+Shift+V.
+    // Голый Ctrl+V (решение владельца, 2026-11-02) текст не вставляет: в
+    // оболочку уходит ^V (0x16, «quoted-insert»); исключение — картинка в буфере,
+    // см. handleCtrlV. WebKitGTK при этом запускал ещё и собственную вставку,
+    // поэтому её гасим — как и у Ctrl+Shift+V.
     if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey && e.code === "KeyV") {
       e.preventDefault();
       e.stopPropagation();
       suppressNativePasteUntil = performance.now() + 400;
-      if (isInteractive.value) {
-        store.send(props.sessionId, encoder.encode("\x16")).catch(() => undefined);
-      }
+      if (isInteractive.value) void handleCtrlV();
       return false;
     }
 
-    // Ctrl+W закрывает вкладку и до оболочки доходить не должен: там это
-    // «стереть слово», и человек терял бы слово в набранной команде.
-    if (e.ctrlKey && !e.shiftKey && !e.altKey && e.code === "KeyW") {
+    // Ctrl+W (⌘W на Mac) закрывает вкладку и до оболочки доходить не должен:
+    // там это «стереть слово», и человек терял бы слово в набранной команде.
+    // На Mac голый Ctrl+W, наоборот, уходит в оболочку — вкладку закрывает ⌘W.
+    if (isAppMod(e) && !e.shiftKey && !e.altKey && e.code === "KeyW") {
       return false;
     }
 
@@ -280,14 +350,14 @@ onMounted(() => {
       pasteFromClipboard();
       return false;
     }
-    // Ctrl+Shift+B — поставить закладку на текущей строке
-    if (e.ctrlKey && e.shiftKey && e.code === "KeyB") {
+    // Ctrl+Shift+B (⇧⌘B) — поставить закладку на текущей строке
+    if (isAppMod(e) && e.shiftKey && e.code === "KeyB") {
       addBookmark();
       return false;
     }
 
-    // Ctrl+F — открыть поиск
-    if (e.ctrlKey && e.code === "KeyF") {
+    // Ctrl+F (⌘F на Mac, где Ctrl+F — «вперёд на символ» в оболочке) — поиск
+    if (isAppMod(e) && e.code === "KeyF") {
       openSearch();
       return false;
     }
@@ -382,6 +452,15 @@ async function reconnect() {
 
 <template>
   <div class="relative h-full w-full bg-surface">
+    <div
+      v-if="imagePaste"
+      data-testid="image-paste-notice"
+      role="status"
+      class="absolute top-2 left-1/2 -translate-x-1/2 z-20 px-3 py-1.5 text-xs rounded border border-edge bg-surface-card"
+      :class="imagePaste === 'failed' ? 'text-danger-text' : 'text-on-surface'"
+    >
+      {{ imagePaste === "failed" ? t("terminalClipboard.imageFailed") : t("terminalClipboard.imageUploading") }}
+    </div>
     <!-- Закладки (#143) -->
     <div
       v-if="bookmarks.panelOpen && bookmarks.list(props.sessionId).length > 0"

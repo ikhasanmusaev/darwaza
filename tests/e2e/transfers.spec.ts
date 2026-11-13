@@ -58,6 +58,16 @@ function makeHandlers(state: any) {
       state.uploads.push(args);
       return "t-upload-1";
     },
+    // Панель файлов шлёт всё через transfer_tree: файл и папку одинаково.
+    // Сводим к тем же записям, чтобы проверки ниже читались по-прежнему.
+    transfer_tree: (args: any) => {
+      if (args.source.kind === "local") {
+        state.uploads.push({ localPath: args.sourcePath, remoteDir: args.targetDir });
+        return "t-upload-1";
+      }
+      state.downloads.push({ remotePath: args.sourcePath, targetDir: args.targetDir });
+      return "t-download-1";
+    },
     transfer_cancel: (args: any) => {
       state.cancelled.push(args.id);
       return true;

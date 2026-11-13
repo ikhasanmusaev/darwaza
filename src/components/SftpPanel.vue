@@ -13,7 +13,9 @@ import {
   Trash2,
   ArrowRight,
   ArrowLeft,
-  Loader2,
+  Eye,
+  EyeOff,
+  Copy,
 } from "lucide-vue-next";
 import { localFsApi, type LocalEntry } from "../api/localfs";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -22,11 +24,18 @@ import { useSftpStore } from "../stores/sftp";
 import type { SftpEntry } from "../api/sftp";
 import ConfirmDialog from "./ConfirmDialog.vue";
 import { errorText } from "../lib/errors";
+import { formatBytes, formatModified, isHidden, permString } from "../lib/files";
+import { writeClipboardText } from "../api/clipboard";
+import type { TreeEndpoint } from "../api/transfers";
+import { useConflictsStore } from "../stores/conflicts";
+import { planTransfers, type OnConflict } from "../lib/transferPlan";
+import { isPicked, nextSelection, type SelectionState } from "../lib/selection";
+import { isMacOS } from "../lib/platform";
 
 const props = defineProps<{ sessionId: string }>();
 const emit = defineEmits<{ close: [] }>();
 
-const { t } = useI18n();
+const { t, locale } = useI18n();
 const store = useSftpStore();
 
 /* ---- Локальная сторона (view-state, в Pinia не выносим: живёт только с панелью) ---- */
@@ -34,7 +43,8 @@ const localPath = ref("");
 const localEntries = ref<LocalEntry[]>([]);
 const localLoading = ref(false);
 const localError = ref<string | null>(null);
-const localSelected = ref<LocalEntry | null>(null);
+/** Выбранные записи: щелчок — одна, Ctrl/⌘ — добавить, Shift — диапазон. */
+const localSel = ref<SelectionState<LocalEntry>>({ picked: [], anchor: null });
 
 async function openLocal(path?: string) {
   localLoading.value = true;
@@ -43,7 +53,7 @@ async function openLocal(path?: string) {
     const target = path ?? (await localFsApi.home());
     localEntries.value = await localFsApi.list(target);
     localPath.value = target;
-    localSelected.value = null;
+    localSel.value = { picked: [], anchor: null };
   } catch (e) {
     localError.value = errorText(e);
   } finally {
@@ -59,6 +69,54 @@ async function localUp() {
 
 /* ---- Удалённая сторона ---- */
 const remote = computed(() => store.pane(props.sessionId));
+
+/** Фильтр по имени в серверной панели: в папке на тысячу файлов иначе не найти. */
+const filter = ref("");
+watch(
+  () => remote.value.path,
+  () => {
+    filter.value = "";
+  },
+);
+
+const visibleLocal = computed(() =>
+  store.showHidden ? localEntries.value : localEntries.value.filter((e) => !isHidden(e.name)),
+);
+const visibleRemote = computed(() => {
+  const needle = filter.value.trim().toLocaleLowerCase();
+  return remote.value.entries.filter(
+    (e) =>
+      (store.showHidden || !isHidden(e.name)) &&
+      (!needle || e.name.toLocaleLowerCase().includes(needle)),
+  );
+});
+
+/** Короткая подсказка «путь скопирован» и т. п. — гаснет сама. */
+const note = ref<string | null>(null);
+let noteTimer: ReturnType<typeof setTimeout> | null = null;
+function showNote(text: string) {
+  note.value = text;
+  if (noteTimer) clearTimeout(noteTimer);
+  noteTimer = setTimeout(() => (note.value = null), 2500);
+}
+onBeforeUnmount(() => {
+  if (noteTimer) clearTimeout(noteTimer);
+});
+
+async function copyRemotePath() {
+  const path = remoteSelected.value?.path ?? remote.value.path;
+  if (!path) return;
+  try {
+    await writeClipboardText(path);
+    showNote(t("sftp.pathCopied", { path }));
+  } catch (e) {
+    opError.value = errorText(e);
+  }
+}
+
+async function onRemoteDblClick(e: SftpEntry) {
+  await store.enter(props.sessionId, e);
+}
 
 /* ---- Перетаскивание из системного файлового менеджера (#124a) ---- */
 
@@ -113,13 +171,16 @@ async function initOsDragDrop() {
     if (!hits(remoteZone.value, x, y)) return;
 
     dragError.value = null;
-    for (const path of payload.paths) {
-      try {
-        await transfers.startUpload(props.sessionId, path, remote.value.path);
-      } catch (e) {
-        // Одна неудача не должна отменять остальные файлы пачки.
-        dragError.value = errorText(e);
-      }
+    // Файл это или папка, backend смотрит сам: система отдаёт только пути.
+    const items = payload.paths.map((path) => ({
+      path,
+      name: path.split(/[\\/]/).filter(Boolean).pop() ?? path,
+      kind: "file",
+    }));
+    try {
+      await transferItems("local", items);
+    } catch (e) {
+      dragError.value = errorText(e);
     }
   });
 }
@@ -141,10 +202,12 @@ const dragError = ref<string | null>(null);
  * Что тащим. Держим в компоненте, а не в dataTransfer: там только строки,
  * а нам нужен и путь, и сторона, и тип записи.
  */
-const dragging = ref<{ side: "local" | "remote"; path: string; isDir: boolean } | null>(null);
+const dragging = ref<{ side: "local" | "remote"; items: Transferable[] } | null>(null);
 
-function onDragStart(side: "local" | "remote", path: string, isDir: boolean) {
-  dragging.value = { side, path, isDir };
+/** Тащат выбранную запись — едут все выбранные; невыбранную — только она. */
+function onDragStart(side: "local" | "remote", entry: Transferable) {
+  const picked = side === "local" ? localSel.value.picked : remoteSel.value.picked;
+  dragging.value = { side, items: isPicked(picked, entry) ? [...picked] : [entry] };
 }
 
 function onDragEnd() {
@@ -152,13 +215,10 @@ function onDragEnd() {
   dropTarget.value = null;
 }
 
-/**
- * Принимать ли дроп: только файл и только с другой стороны.
- * Папки не тащим — рекурсивная передача это отдельная история.
- */
+/** Принимать ли дроп: файл или папку, но только с другой стороны. */
 function canDropOn(side: "local" | "remote"): boolean {
   const d = dragging.value;
-  return !!d && d.side !== side && !d.isDir;
+  return !!d && d.side !== side;
 }
 
 function onDragOver(side: "local" | "remote", e: DragEvent) {
@@ -175,102 +235,120 @@ async function onDrop(side: "local" | "remote") {
   const d = dragging.value;
   dropTarget.value = null;
   dragging.value = null;
-  if (!d || d.side === side || d.isDir) return;
+  if (!d || d.side === side) return;
 
   dragError.value = null;
   try {
-    if (side === "local") {
-      await transfers.startDownload(props.sessionId, d.path, localPath.value);
-    } else {
-      await transfers.startUpload(props.sessionId, d.path, remote.value.path);
-    }
+    await transferItems(d.side, d.items);
   } catch (e) {
     dragError.value = errorText(e);
   }
 }
-const remoteSelected = ref<SftpEntry | null>(null);
+const remoteSel = ref<SelectionState<SftpEntry>>({ picked: [], anchor: null });
+const remoteSelected = computed(() => remoteSel.value.anchor);
 
 watch(
   () => remote.value.path,
   () => {
-    remoteSelected.value = null;
+    remoteSel.value = { picked: [], anchor: null };
   },
 );
+
+/** Модификатор «добавить к выбору»: ⌘ на Mac, Ctrl на остальных. */
+function pickMods(ev: MouseEvent) {
+  return { toggle: isMacOS() ? ev.metaKey : ev.ctrlKey, range: ev.shiftKey };
+}
+function pickLocal(e: LocalEntry, ev: MouseEvent) {
+  localSel.value = nextSelection(visibleLocal.value, localSel.value, e, pickMods(ev));
+}
+function pickRemote(e: SftpEntry, ev: MouseEvent) {
+  remoteSel.value = nextSelection(visibleRemote.value, remoteSel.value, e, pickMods(ev));
+}
 
 onMounted(() => {
   openLocal();
   if (!remote.value.path) store.open(props.sessionId);
 });
 
-/* ---- Передача файлов (#123) ---- */
-const transferring = ref(false);
-const transferNote = ref<string | null>(null);
+/* ---- Передача файлов (#123, #124) ----
+ *
+ * И кнопки, и перетаскивание идут фоновой передачей: ход и отмена — в полосе
+ * внизу окна, папки передаются целиком, а одноимённый файл на месте
+ * назначения не затирается — новый получает имя «файл (2)».
+ */
+const LOCAL: TreeEndpoint = { kind: "local" };
+const remoteEnd = (): TreeEndpoint => ({ kind: "remote", sessionId: props.sessionId });
+
+interface Transferable {
+  path: string;
+  name: string;
+  kind: string;
+}
+
+/** Передать запись с одной стороны в папку, открытую на другой. */
+async function startTransfer(
+  from: "local" | "remote",
+  path: string,
+  isDir: boolean,
+  onConflict: OnConflict,
+) {
+  if (from === "local") {
+    await transfers.startTree(LOCAL, path, isDir, remoteEnd(), remote.value.path, onConflict);
+  } else {
+    await transfers.startTree(remoteEnd(), path, isDir, LOCAL, localPath.value, onConflict);
+  }
+}
+
+/**
+ * Передать несколько записей. Если в папке назначения уже есть такие имена,
+ * сначала спрашиваем: заменить, оставить оба или пропустить.
+ */
+const conflicts = useConflictsStore();
+async function transferItems(from: "local" | "remote", items: Transferable[]) {
+  const wanted = items.filter((i) => transferable(i.kind));
+  const existing =
+    from === "local"
+      ? remote.value.entries.map((e) => e.name)
+      : localEntries.value.map((e) => e.name);
+  const plan = await planTransfers(wanted, existing, conflicts.ask);
+  for (const { item, onConflict } of plan) {
+    // Одна неудача не должна отменять остальные записи пачки.
+    try {
+      await startTransfer(from, item.path, item.kind === "dir", onConflict);
+    } catch (e) {
+      transferError.value = errorText(e);
+    }
+  }
+}
+
+/** Ссылки и особые файлы не передаём: передача их всё равно пропустит. */
+const transferable = (kind: string) => kind === "file" || kind === "dir";
+const canUpload = computed(
+  () => localSel.value.picked.some((e) => transferable(e.kind)) && !!remote.value.path,
+);
+const canDownload = computed(
+  () => remoteSel.value.picked.some((e) => transferable(e.kind)) && !!localPath.value,
+);
+
 const transferError = ref<string | null>(null);
 
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(n / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-}
-
-/** Путь-приёмник строим из текущей директории противоположной панели. */
-function joinLocal(dir: string, name: string): string {
-  return dir.endsWith("/") ? `${dir}${name}` : `${dir}/${name}`;
-}
-function joinRemote(dir: string, name: string): string {
-  return dir === "/" ? `/${name}` : `${dir.replace(/\/+$/, "")}/${name}`;
-}
-
-const canUpload = computed(() => localSelected.value?.kind === "file" && !!remote.value.path);
-const canDownload = computed(() => remoteSelected.value?.kind === "file" && !!localPath.value);
-
 async function upload() {
-  const src = localSelected.value;
-  if (!src || src.kind !== "file") return;
-  transferring.value = true;
   transferError.value = null;
-  transferNote.value = null;
-  try {
-    const bytes = await store.upload(
-      props.sessionId,
-      src.path,
-      joinRemote(remote.value.path, src.name),
-    );
-    transferNote.value = t("sftp.uploaded", {
-      name: src.name,
-      size: formatBytes(bytes),
-    });
-  } catch (e) {
-    transferError.value = errorText(e);
-  } finally {
-    transferring.value = false;
-  }
+  await transferItems("local", localSel.value.picked);
 }
 
 async function download() {
-  const src = remoteSelected.value;
-  if (!src || src.kind !== "file") return;
-  transferring.value = true;
   transferError.value = null;
-  transferNote.value = null;
-  try {
-    const bytes = await store.download(
-      props.sessionId,
-      src.path,
-      joinLocal(localPath.value, src.name),
-    );
-    transferNote.value = t("sftp.downloaded", {
-      name: src.name,
-      size: formatBytes(bytes),
-    });
-    await openLocal(localPath.value);
-  } catch (e) {
-    transferError.value = errorText(e);
-  } finally {
-    transferring.value = false;
-  }
+  await transferItems("remote", remoteSel.value.picked);
 }
+
+/** Передача закончилась — в обеих папках могли появиться новые записи. */
+const finishedCount = computed(() => transfers.items.filter((x) => x.status === "DONE").length);
+watch(finishedCount, (now, before) => {
+  if (now <= before) return;
+  void store.refresh(props.sessionId);
+  if (localPath.value) void openLocal(localPath.value);
+});
 
 /* ---- Операции над удалённой стороной ----
  *
@@ -279,6 +357,10 @@ async function download() {
  * игнорирования, и операция молча ничего не сделает.
  */
 const opError = ref<string | null>(null);
+
+function joinRemote(dir: string, name: string): string {
+  return dir === "/" ? `/${name}` : `${dir.replace(/\/+$/, "")}/${name}`;
+}
 const promptMode = ref<"mkdir" | "rename" | null>(null);
 const promptValue = ref("");
 
@@ -288,8 +370,10 @@ function startMkdir() {
   opError.value = null;
 }
 
+const canRename = computed(() => remoteSel.value.picked.length === 1);
+
 function startRename() {
-  if (!remoteSelected.value) return;
+  if (!remoteSelected.value || !canRename.value) return;
   promptMode.value = "rename";
   promptValue.value = remoteSelected.value.name;
   opError.value = null;
@@ -318,18 +402,29 @@ async function submitPrompt() {
   }
 }
 
-const toDelete = ref<SftpEntry | null>(null);
+const toDelete = ref<SftpEntry[] | null>(null);
+
+const deleteDescription = computed(() => {
+  const list = toDelete.value;
+  if (!list || list.length === 0) return t("dialog.deleteDescription");
+  if (list.length === 1) return `${list[0].name} — ${t("dialog.deleteDescription")}`;
+  return t("sftp.deleteMany", { count: list.length });
+});
 
 async function onConfirmDelete() {
-  const target = toDelete.value;
+  const targets = toDelete.value ?? [];
   toDelete.value = null;
-  if (!target) return;
   opError.value = null;
-  try {
-    await store.remove(props.sessionId, target.path, target.kind === "dir");
-  } catch (e) {
-    opError.value = errorText(e);
+  for (const target of targets) {
+    try {
+      await store.remove(props.sessionId, target.path, target.kind === "dir");
+    } catch (e) {
+      // Сервер на непустую папку отвечает общей ошибкой, без причины. Удаление
+      // намеренно не рекурсивное, и человеку надо сказать, что делать.
+      opError.value = target.kind === "dir" ? t("sftp.deleteDirFailed") : errorText(e);
+    }
   }
+  remoteSel.value = { picked: [], anchor: null };
 }
 
 function iconFor(kind: string) {
@@ -344,7 +439,6 @@ function iconFor(kind: string) {
     <!-- Header -->
     <div class="flex items-center gap-2 px-3 py-2 border-b border-edge shrink-0">
       <h3 class="text-sm font-semibold text-on-surface">{{ t("sftp.title") }}</h3>
-      <Loader2 v-if="transferring" :size="14" class="animate-spin text-warning" />
       <button
         type="button"
         class="ml-auto inline-flex items-center justify-center w-7 h-7 rounded hover:bg-surface-alt text-on-surface-muted"
@@ -357,16 +451,17 @@ function iconFor(kind: string) {
 
     <!-- Сообщения о передаче -->
     <div
-      v-if="transferError"
+      v-if="transferError || dragError"
       class="mx-3 mt-2 bg-danger-soft border border-danger/40 text-danger-text text-xs rounded px-2 py-1.5"
     >
-      {{ transferError }}
+      {{ transferError || dragError }}
     </div>
     <div
-      v-else-if="transferNote"
-      class="mx-3 mt-2 bg-success-soft border border-success/30 text-success-text text-xs rounded px-2 py-1.5"
+      v-if="note"
+      data-testid="sftp-note"
+      class="mx-3 mt-2 bg-success-soft border border-success/30 text-success-text text-xs rounded px-2 py-1.5 truncate"
     >
-      {{ transferNote }}
+      {{ note }}
     </div>
     <div
       v-if="opError"
@@ -419,21 +514,22 @@ function iconFor(kind: string) {
             {{ localError }}
           </p>
           <button
-            v-for="e in localEntries"
+            v-for="e in visibleLocal"
             v-else
             :key="e.path"
             type="button"
             draggable="true"
             data-testid="local-entry"
-            @dragstart="onDragStart('local', e.path, e.kind === 'dir')"
-            @dragend="onDragEnd"
             class="w-full flex items-center gap-2 px-3 py-1 text-left text-xs hover:bg-surface-alt"
             :class="
-              localSelected?.path === e.path
+              isPicked(localSel.picked, e)
                 ? 'bg-surface-alt text-on-surface'
                 : 'text-on-surface-muted'
             "
-            @click="localSelected = e"
+            :aria-selected="isPicked(localSel.picked, e)"
+            @dragstart="onDragStart('local', e)"
+            @dragend="onDragEnd"
+            @click="pickLocal(e, $event)"
             @dblclick="e.kind === 'dir' ? openLocal(e.path) : undefined"
           >
             <component
@@ -456,7 +552,7 @@ function iconFor(kind: string) {
           type="button"
           class="p-2 rounded bg-surface-alt hover:bg-surface-card text-on-surface disabled:opacity-40"
           :title="t('sftp.upload')"
-          :disabled="!canUpload || transferring"
+          :disabled="!canUpload"
           @click="upload"
         >
           <ArrowRight :size="16" />
@@ -465,7 +561,7 @@ function iconFor(kind: string) {
           type="button"
           class="p-2 rounded bg-surface-alt hover:bg-surface-card text-on-surface disabled:opacity-40"
           :title="t('sftp.download')"
-          :disabled="!canDownload || transferring"
+          :disabled="!canDownload"
           @click="download"
         >
           <ArrowLeft :size="16" />
@@ -506,7 +602,7 @@ function iconFor(kind: string) {
             type="button"
             class="p-1 rounded hover:bg-surface-alt text-on-surface-muted disabled:opacity-40"
             :title="t('sftp.rename')"
-            :disabled="!remoteSelected"
+            :disabled="!canRename"
             @click="startRename"
           >
             <Pencil :size="14" />
@@ -515,14 +611,42 @@ function iconFor(kind: string) {
             type="button"
             class="p-1 rounded hover:bg-danger-soft text-on-surface-muted hover:text-danger-text disabled:opacity-40"
             :title="t('sftp.delete')"
-            :disabled="!remoteSelected"
-            @click="toDelete = remoteSelected"
+            :disabled="remoteSel.picked.length === 0"
+            @click="toDelete = [...remoteSel.picked]"
           >
             <Trash2 :size="14" />
+          </button>
+          <button
+            type="button"
+            data-testid="sftp-copy-path"
+            class="p-1 rounded hover:bg-surface-alt text-on-surface-muted"
+            :title="t('sftp.copyPath')"
+            @click="copyRemotePath"
+          >
+            <Copy :size="14" />
+          </button>
+          <button
+            type="button"
+            data-testid="sftp-toggle-hidden"
+            class="p-1 rounded hover:bg-surface-alt text-on-surface-muted"
+            :title="t('sftp.hiddenFiles')"
+            :aria-pressed="store.showHidden"
+            @click="store.setShowHidden(!store.showHidden)"
+          >
+            <component :is="store.showHidden ? Eye : EyeOff" :size="14" />
           </button>
           <code class="ml-1 text-[11px] text-on-surface-muted truncate" :title="remote.path">
             {{ remote.path }}
           </code>
+        </div>
+        <div class="px-2 py-1 border-b border-edge">
+          <input
+            v-model="filter"
+            type="search"
+            data-testid="sftp-filter"
+            class="w-full bg-surface border border-edge rounded px-2 py-0.5 text-xs focus:outline-none focus:border-accent"
+            :placeholder="t('sftp.filter')"
+          />
         </div>
 
         <!-- Инлайн-ввод имени для создания папки / переименования -->
@@ -574,28 +698,30 @@ function iconFor(kind: string) {
             {{ remote.error }}
           </p>
           <p
-            v-else-if="remote.entries.length === 0"
+            v-else-if="visibleRemote.length === 0"
             class="px-3 py-2 text-xs text-on-surface-muted"
           >
-            {{ t("sftp.empty") }}
+            {{ remote.entries.length === 0 ? t("sftp.empty") : t("sftp.nothingMatches") }}
           </p>
           <button
-            v-for="e in remote.entries"
+            v-for="e in visibleRemote"
             v-else
             :key="e.path"
             type="button"
             draggable="true"
             data-testid="remote-entry"
-            @dragstart="onDragStart('remote', e.path, e.kind === 'dir')"
-            @dragend="onDragEnd"
             class="w-full flex items-center gap-2 px-3 py-1 text-left text-xs hover:bg-surface-alt"
             :class="
-              remoteSelected?.path === e.path
+              isPicked(remoteSel.picked, e)
                 ? 'bg-surface-alt text-on-surface'
                 : 'text-on-surface-muted'
             "
-            @click="remoteSelected = e"
-            @dblclick="e.kind === 'dir' ? store.open(props.sessionId, e.path) : undefined"
+            :title="[permString(e.permissions), formatModified(e.modified, locale)].filter(Boolean).join('  ')"
+            :aria-selected="isPicked(remoteSel.picked, e)"
+            @dragstart="onDragStart('remote', e)"
+            @dragend="onDragEnd"
+            @click="pickRemote(e, $event)"
+            @dblclick="onRemoteDblClick(e)"
           >
             <component
               :is="iconFor(e.kind)"
@@ -604,8 +730,17 @@ function iconFor(kind: string) {
               :class="e.kind === 'dir' ? 'text-warning' : ''"
             />
             <span class="truncate">{{ e.name }}</span>
-            <span v-if="e.kind === 'file'" class="ml-auto shrink-0 text-on-surface-muted">
-              {{ formatBytes(e.size) }}
+            <span class="ml-auto shrink-0 text-on-surface-muted tabular-nums">
+              {{ e.kind === "file" ? formatBytes(e.size) : "" }}
+            </span>
+            <span
+              class="hidden xl:inline shrink-0 w-24 text-right text-on-surface-muted tabular-nums"
+              data-testid="remote-entry-modified"
+            >
+              {{ formatModified(e.modified, locale) }}
+            </span>
+            <span class="hidden xl:inline shrink-0 font-mono text-[10px] text-on-surface-muted">
+              {{ permString(e.permissions) }}
             </span>
           </button>
         </div>
@@ -615,11 +750,7 @@ function iconFor(kind: string) {
     <ConfirmDialog
       :open="toDelete !== null"
       :title="t('dialog.deleteTitle')"
-      :description="
-        toDelete
-          ? `${toDelete.name} — ${t('dialog.deleteDescription')}`
-          : t('dialog.deleteDescription')
-      "
+      :description="deleteDescription"
       :confirm-label="t('form.delete')"
       :cancel-label="t('form.cancel')"
       variant="danger"

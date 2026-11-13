@@ -47,6 +47,22 @@ pub fn ensure_private_dir(dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Закрытый каталог с закрытыми файлами внутри: сам — `0700`, файлы — `0600`.
+///
+/// Для журналов и отчётов о сбоях. Их пишет не наш код (журнал — библиотека
+/// `tracing-appender`), и файлы появляются с правами по умолчанию, обычно
+/// `0644`. Закрытый каталог не пускает к ним чужих, а права файлов правим для
+/// случая, когда каталог кто-то откроет обратно.
+pub fn ensure_private_tree(dir: &std::path::Path) -> Result<()> {
+    ensure_private_dir(dir)?;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            tighten_file(&entry.path());
+        }
+    }
+    Ok(())
+}
+
 /// Ужесточить права существующего файла до `0600`. Нет файла — не ошибка.
 pub fn tighten_file(path: &std::path::Path) {
     #[cfg(unix)]
@@ -219,6 +235,21 @@ pub(crate) mod tests {
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o700
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)] // права файла в стиле unix; на Windows их задаёт профиль пользователя
+    #[test]
+    fn a_private_tree_closes_the_dir_and_the_files_already_in_it() {
+        let dir = scratch("tree");
+        with_open_umask(|| {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("app.log.2026-11-10"), "журнал").unwrap();
+            ensure_private_tree(&dir).unwrap();
+        });
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join("app.log.2026-11-10")), 0o600);
         std::fs::remove_dir_all(&dir).ok();
     }
 

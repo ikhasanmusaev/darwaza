@@ -1,6 +1,6 @@
 # Darwaza
 
-A local-first SSH and SFTP client for Linux: host manager, tabbed terminal with
+A local-first SSH and SFTP client for Linux, Windows and macOS: host manager, tabbed terminal with
 split panes, snippets, port forwarding, a two-pane SFTP screen, and an optional
 AI-assistant channel where **you confirm every change** before it runs.
 
@@ -32,14 +32,20 @@ them**, so a reinstall finds your hosts again. For a complete removal, delete bo
 folders by hand after uninstalling. Passwords and key passphrases are kept in Windows
 Credential Manager (entries named `darwaza`); remove them there if you want them gone.
 
+### macOS
+
+Download `Darwaza_<version>_universal.dmg` from the same page. One file runs on both
+Apple Silicon and Intel Macs. It is signed with a Developer ID and notarized by Apple,
+so it opens without warnings: open the `.dmg` and drag Darwaza into Applications.
+Passwords and key passphrases are kept in the macOS Keychain.
+
 ## SFTP is still rough
 
-File transfer works, but it is not comfortable yet, and we know it. Next releases
-will bring:
+File transfer works, but it is not comfortable yet, and we know it. Since 0.1.2 the
+app asks what to do when a name is taken and lets you pick several files at once.
+Next releases will bring:
 
-- asking what to do when a file with the same name exists: replace, skip or rename;
 - deleting a folder with everything inside, after a confirmation;
-- selecting several files at once;
 - an editable path bar and sorting by name, size and date;
 - changing permissions (chmod);
 - editing a server file in your own editor;
@@ -88,6 +94,7 @@ these cases:
 |---|---|---|
 | You connect to a host, open SFTP, or use port forwarding | the SSH servers you configured (and their jump hosts) | `src-tauri/src/commands/ssh.rs`, `sftp.rs`, `forwarding/` |
 | The host list probes reachability | the hosts you saved, TCP port only | `src-tauri/src/commands/probe.rs` |
+| You press Ctrl+V in a terminal with only an image in the clipboard | that server, over the same SSH connection; saved as a file only you can read, and its path is pasted | `src-tauri/src/commands/sftp.rs` |
 | You press **Check for updates** in *About* | `https://darwaza.uz/updates/…`; the download is verified by an Ed25519 signature | `tauri-plugin-updater`, `src-tauri/tauri.conf.json` |
 | You sign in to an account (optional) | `https://api.darwaza.uz` or the server address you set | `src-tauri/src/sync/api.rs` |
 | You press **Send** on a crash report and set an endpoint | the endpoint you typed; collection is off by default | `src-tauri/src/commands/crash.rs` |

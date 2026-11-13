@@ -1226,8 +1226,7 @@ async fn run_session(
         }
     }
 
-    // mut: `tcpip_forward` берёт `&mut self`.
-    let mut session = target_session.expect("цепочка не может быть пустой");
+    let session = target_session.expect("цепочка не может быть пустой");
 
     // Экран SFTP: терминал не нужен, оболочку на сервере не заводим.
     let mut channel: Option<russh::Channel<client::Msg>> = None;
@@ -1308,6 +1307,16 @@ async fn run_session(
     let mut pty_cols: u32 = 80;
     let mut pty_rows: u32 = 24;
 
+    // Запросы, которые ждут ответа сервера (замер задержки, SFTP, команды
+    // агента, пробросы), идут отдельными задачами. Раньше цикл ждал их сам, и
+    // на плохой сети каждый замер задержки на секунды останавливал всё
+    // остальное: ввод, вывод и закрытие вкладки.
+    //
+    // RwLock только потому, что `tcpip_forward` берёт `&mut self`; остальным
+    // хватает чтения, и они идут параллельно.
+    let session = Arc::new(tokio::sync::RwLock::new(session));
+    let mut requests = tokio::task::JoinSet::new();
+
     loop {
         tokio::select! {
             biased;
@@ -1361,69 +1370,77 @@ async fn run_session(
                         let _ = responder.send(result);
                     }
                     Some(SessionCmd::Latency { responder }) => {
-                        let started = std::time::Instant::now();
-                        // Жёсткий предел: пока идёт замер, эта задача не читает
-                        // ввод, и зависший канал не должен подвесить терминал.
-                        let result = match tokio::time::timeout(
-                            Duration::from_secs(3),
-                            session.channel_open_session(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(channel)) => {
-                                let millis = started.elapsed().as_millis() as u64;
-                                let _ = channel.close().await;
-                                Ok(millis)
-                            }
-                            Ok(Err(e)) => Err(crate::errors::opaque("ssh_latency", e)),
-                            Err(_) => Err(crate::errors::codes::SSH_TIMED_OUT.to_string()),
-                        };
-                        let _ = responder.send(result);
+                        let session = session.clone();
+                        requests.spawn(async move {
+                            let session = session.read().await;
+                            let _ = responder.send(measure_latency(&session).await);
+                        });
                     }
                     Some(SessionCmd::OpenSftp { responder }) => {
-                        let result = open_sftp_channel(&session).await;
-                        if let Err(e) = &result {
-                            warn!(target: "sftp", "session {session_id}: open sftp channel failed: {e}");
-                        }
-                        // Ошибку получателя игнорируем: вызывающая команда могла
-                        // отвалиться по таймауту — сессию это ронять не должно.
-                        let _ = responder.send(result);
+                        let session = session.clone();
+                        requests.spawn(async move {
+                            let result = open_sftp_channel(&*session.read().await).await;
+                            if let Err(e) = &result {
+                                warn!(target: "sftp", "session {session_id}: open sftp channel failed: {e}");
+                            }
+                            // Ошибку получателя игнорируем: вызывающая команда могла
+                            // отвалиться по таймауту — сессию это ронять не должно.
+                            let _ = responder.send(result);
+                        });
                     }
                     Some(SessionCmd::Exec {
                         command,
                         limit,
                         responder,
                     }) => {
-                        let result = run_exec(&session, &command, limit).await;
-                        if let Err(e) = &result {
-                            warn!(target: "ssh.exec", "session {session_id}: {e}");
-                        }
-                        let _ = responder.send(result);
+                        let session = session.clone();
+                        requests.spawn(async move {
+                            let result = run_exec(&*session.read().await, &command, limit).await;
+                            if let Err(e) = &result {
+                                warn!(target: "ssh.exec", "session {session_id}: {e}");
+                            }
+                            let _ = responder.send(result);
+                        });
                     }
                     Some(SessionCmd::OpenDirectTcpip { host, port, originator_host, originator_port, responder }) => {
-                        let result = session
-                            .channel_open_direct_tcpip(host.clone(), port, originator_host, originator_port)
-                            .await
-                            .map_err(|e| format!("direct-tcpip до {host}:{port} не открылся: {e}"));
-                        if let Err(e) = &result {
-                            warn!(target: "forward", "session {session_id}: {e}");
-                        }
-                        let _ = responder.send(result);
+                        let session = session.clone();
+                        requests.spawn(async move {
+                            let result = session
+                                .read()
+                                .await
+                                .channel_open_direct_tcpip(host.clone(), port, originator_host, originator_port)
+                                .await
+                                .map_err(|e| format!("direct-tcpip до {host}:{port} не открылся: {e}"));
+                            if let Err(e) = &result {
+                                warn!(target: "forward", "session {session_id}: {e}");
+                            }
+                            let _ = responder.send(result);
+                        });
                     }
                     Some(SessionCmd::RequestRemoteForward { address, port, responder }) => {
-                        let result = session
-                            .tcpip_forward(address.clone(), port)
-                            .await
-                            .map_err(|e| format!("сервер отказал в прослушке {address}:{port}: {e}"));
-                        if let Err(e) = &result {
-                            warn!(target: "forward", "session {session_id}: {e}");
-                        }
-                        let _ = responder.send(result);
+                        // Снять прослушку интерфейс может только после ответа на
+                        // этот запрос, поэтому порядок двух задач не путается.
+                        let session = session.clone();
+                        requests.spawn(async move {
+                            let result = session
+                                .write()
+                                .await
+                                .tcpip_forward(address.clone(), port)
+                                .await
+                                .map_err(|e| format!("сервер отказал в прослушке {address}:{port}: {e}"));
+                            if let Err(e) = &result {
+                                warn!(target: "forward", "session {session_id}: {e}");
+                            }
+                            let _ = responder.send(result);
+                        });
                     }
                     Some(SessionCmd::CancelRemoteForward { address, port }) => {
-                        if let Err(e) = session.cancel_tcpip_forward(address.clone(), port).await {
-                            warn!(target: "forward", "session {session_id}: снятие прослушки {address}:{port}: {e}");
-                        }
+                        let session = session.clone();
+                        requests.spawn(async move {
+                            if let Err(e) = session.read().await.cancel_tcpip_forward(address.clone(), port).await {
+                                warn!(target: "forward", "session {session_id}: снятие прослушки {address}:{port}: {e}");
+                            }
+                        });
                     }
                     Some(SessionCmd::Disconnect) => {
                         disconnect_requested = true;
@@ -1460,8 +1477,14 @@ async fn run_session(
                     None => break,
                 }
             }
+
+            // Убираем завершённые запросы, чтобы набор не рос.
+            Some(_) = requests.join_next(), if !requests.is_empty() => {}
         }
     }
+
+    // Недоделанные запросы сессии больше не нужны: их ответов никто не ждёт.
+    requests.abort_all();
 
     // Сессия закончилась — закрываем запись, иначе на диске останется
     // файл без дописанного хвоста буфера.
@@ -1481,17 +1504,45 @@ async fn run_session(
         manager
             .set_status(session_id, SessionStatus::Disconnecting)
             .await;
-        if let Some(channel) = channel.as_ref() {
-            let _ = channel.eof().await;
+        // Вежливо попрощаться с сервером, но не дольше секунды: закрытие не
+        // должно зависеть от сети. Не успели — соединение просто обрывается,
+        // и сервер сам закроет сессию.
+        let goodbye = async {
+            if let Some(channel) = channel.as_ref() {
+                let _ = channel.eof().await;
+            }
+            let _ = session
+                .read()
+                .await
+                .disconnect(russh::Disconnect::ByApplication, "", "en")
+                .await;
+        };
+        if tokio::time::timeout(DISCONNECT_GRACE, goodbye).await.is_err() {
+            warn!(target: "ssh", "session {session_id}: сервер не ответил на прощание, соединение закрыто без него");
         }
-        let _ = session
-            .disconnect(russh::Disconnect::ByApplication, "", "en")
-            .await;
     }
 
     emit_status(&app, session_id, SessionStatus::Closed, None);
     manager.set_status(session_id, SessionStatus::Closed).await;
     Ok(exit_code)
+}
+
+/// Сколько ждём сервер при закрытии вкладки.
+const DISCONNECT_GRACE: Duration = Duration::from_secs(1);
+
+/// Задержка до сервера: время открытия служебного канала. Больше трёх секунд
+/// не ждём — такой ответ всё равно не нужен.
+async fn measure_latency<H: client::Handler>(session: &Handle<H>) -> Result<u64, String> {
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(Duration::from_secs(3), session.channel_open_session()).await {
+        Ok(Ok(channel)) => {
+            let millis = started.elapsed().as_millis() as u64;
+            let _ = channel.close().await;
+            Ok(millis)
+        }
+        Ok(Err(e)) => Err(crate::errors::opaque("ssh_latency", e)),
+        Err(_) => Err(crate::errors::codes::SSH_TIMED_OUT.to_string()),
+    }
 }
 
 #[tauri::command]

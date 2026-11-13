@@ -11,13 +11,22 @@ import {
   Pencil,
   Trash2,
   Loader2,
+  Eye,
+  EyeOff,
+  X,
 } from "lucide-vue-next";
 import { useFilesStore, type FileEntry, type Side } from "../stores/files";
 import { useHostsStore } from "../stores/hosts";
 import ConfirmDialog from "./ConfirmDialog.vue";
+import { useSftpStore } from "../stores/sftp";
+import { formatBytes, formatModified, isHidden, permString } from "../lib/files";
+import { isPicked } from "../lib/selection";
+import { isMacOS } from "../lib/platform";
 
 const props = defineProps<{ side: Side }>();
-const { t } = useI18n();
+const { t, locale } = useI18n();
+/** Настройка скрытых файлов общая с боковой панелью файлов. */
+const sftp = useSftpStore();
 const files = useFilesStore();
 const hosts = useHostsStore();
 
@@ -37,12 +46,9 @@ function onSource(e: Event) {
   else void files.setSource(props.side, { kind: "host", hostId: Number(v.slice(5)) });
 }
 
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(n / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-}
+const visibleEntries = computed(() =>
+  sftp.showHidden ? pane.value.entries : pane.value.entries.filter((e) => !isHidden(e.name)),
+);
 
 function iconFor(kind: FileEntry["kind"]) {
   if (kind === "dir") return Folder;
@@ -68,20 +74,47 @@ async function submitPrompt() {
   else if (pane.value.selected) await files.rename(props.side, pane.value.selected, name);
 }
 
+/* ---- Выбор ---- */
+function onPick(e: FileEntry, ev: MouseEvent) {
+  const toggle = isMacOS() ? ev.metaKey : ev.ctrlKey;
+  files.pick(props.side, e, { toggle, range: ev.shiftKey }, visibleEntries.value);
+}
+const canRename = computed(() => pane.value.picked.length === 1);
+
 /* ---- Удаление (с подтверждением) ---- */
-const toDelete = ref<FileEntry | null>(null);
+const toDelete = ref<FileEntry[] | null>(null);
+
+const deleteDescription = computed(() => {
+  const list = toDelete.value;
+  if (!list || list.length === 0) return t("dialog.deleteDescription");
+  if (list.length === 1) return `${list[0].name} — ${t("dialog.deleteDescription")}`;
+  return t("sftp.deleteMany", { count: list.length });
+});
 
 async function confirmDelete() {
-  const target = toDelete.value;
+  const targets = toDelete.value ?? [];
   toDelete.value = null;
-  if (target) await files.remove(props.side, target);
+  let dirFailed = false;
+  let error: string | null = null;
+  for (const target of targets) {
+    const ok = await files.remove(props.side, target);
+    if (ok) continue;
+    if (target.kind === "dir") dirFailed = true;
+    else error = pane.value.opError;
+  }
+  // Сервер на непустую папку отвечает общей ошибкой, без причины, а удаление
+  // намеренно не рекурсивное — говорим, что делать.
+  if (dirFailed) pane.value.opError = t("sftp.deleteDirFailed");
+  else if (error) pane.value.opError = error;
 }
 
 /* ---- Перетаскивание между панелями ---- */
 const dropHover = ref(false);
 
+/** Тащат выбранную запись — едут все выбранные; невыбранную — только она. */
 function onDragStart(entry: FileEntry) {
-  files.dragging = { side: props.side, entry };
+  const picked = pane.value.picked;
+  files.dragging = { side: props.side, entries: isPicked(picked, entry) ? [...picked] : [entry] };
 }
 function onDragEnd() {
   files.dragging = null;
@@ -89,7 +122,7 @@ function onDragEnd() {
 }
 function canDrop(): boolean {
   const d = files.dragging;
-  return !!d && d.side !== props.side && files.canTransfer(d.side, d.entry);
+  return !!d && d.side !== props.side && files.canTransfer(d.side, d.entries);
 }
 function onDragOver(e: DragEvent) {
   if (!canDrop()) return;
@@ -100,7 +133,7 @@ async function onDrop() {
   const d = files.dragging;
   dropHover.value = false;
   files.dragging = null;
-  if (d && d.side !== props.side) await files.transfer(d.side, d.entry);
+  if (d && d.side !== props.side) await files.transfer(d.side, d.entries);
 }
 </script>
 
@@ -152,7 +185,7 @@ async function onDrop() {
           type="button"
           class="p-1 rounded hover:bg-surface-alt text-on-surface-muted disabled:opacity-40"
           :title="t('sftp.rename')"
-          :disabled="!pane.selected"
+          :disabled="!canRename"
           :data-testid="`files-rename-${side}`"
           @click="startPrompt('rename')"
         >
@@ -162,11 +195,21 @@ async function onDrop() {
           type="button"
           class="p-1 rounded hover:bg-danger-soft text-on-surface-muted hover:text-danger-text disabled:opacity-40"
           :title="t('sftp.delete')"
-          :disabled="!pane.selected"
+          :disabled="pane.picked.length === 0"
           :data-testid="`files-delete-${side}`"
-          @click="toDelete = pane.selected"
+          @click="toDelete = [...pane.picked]"
         >
           <Trash2 :size="14" />
+        </button>
+        <button
+          type="button"
+          class="p-1 rounded hover:bg-surface-alt text-on-surface-muted"
+          :title="t('sftp.hiddenFiles')"
+          :aria-pressed="sftp.showHidden"
+          :data-testid="`files-hidden-${side}`"
+          @click="sftp.setShowHidden(!sftp.showHidden)"
+        >
+          <component :is="sftp.showHidden ? Eye : EyeOff" :size="14" />
         </button>
       </template>
     </div>
@@ -175,6 +218,17 @@ async function onDrop() {
       <code class="text-[14px] text-on-surface-muted truncate block" :title="pane.path" :data-testid="`files-path-${side}`">
         {{ pane.path }}
       </code>
+    </div>
+
+    <div
+      v-if="pane.opError"
+      class="mx-2 mt-2 flex items-start gap-2 bg-danger-soft border border-danger/40 text-danger-text text-xs rounded px-2 py-1.5"
+      :data-testid="`files-op-error-${side}`"
+    >
+      <span class="flex-1">{{ pane.opError }}</span>
+      <button type="button" class="shrink-0" :title="t('form.cancel')" @click="pane.opError = null">
+        <X :size="12" />
+      </button>
     </div>
 
     <form
@@ -211,23 +265,26 @@ async function onDrop() {
       <p v-else-if="pane.loading" class="px-3 py-2 text-xs text-on-surface-muted">{{ t("common.loading") }}</p>
       <p v-else-if="pane.error" class="px-3 py-2 text-xs text-danger-text" :data-testid="`files-error-${side}`">{{ pane.error }}</p>
       <template v-else>
-        <p v-if="pane.entries.length === 0" class="px-3 py-2 text-xs text-on-surface-muted">{{ t("sftp.empty") }}</p>
+        <p v-if="visibleEntries.length === 0" class="px-3 py-2 text-xs text-on-surface-muted">{{ t("sftp.empty") }}</p>
         <button
-          v-for="e in pane.entries"
+          v-for="e in visibleEntries"
           :key="e.path"
           type="button"
           draggable="true"
           :data-testid="`files-entry-${side}`"
           class="w-full flex items-center gap-2 px-3 py-1.5 text-left text-[15px] leading-5 hover:bg-surface-alt"
-          :class="pane.selected?.path === e.path ? 'bg-surface-alt text-on-surface' : 'text-on-surface-muted'"
-          @click="pane.selected = e"
-          @dblclick="e.kind === 'dir' ? files.open(side, e.path) : undefined"
+          :class="isPicked(pane.picked, e) ? 'bg-surface-alt text-on-surface' : 'text-on-surface-muted'"
+          :aria-selected="isPicked(pane.picked, e)"
+          :title="[permString(e.permissions), formatModified(e.modified, locale)].filter(Boolean).join('  ')"
+          @click="onPick(e, $event)"
+          @dblclick="files.enter(side, e)"
           @dragstart="onDragStart(e)"
           @dragend="onDragEnd"
         >
           <component :is="iconFor(e.kind)" :size="16" class="shrink-0" :class="e.kind === 'dir' ? 'text-warning' : ''" />
           <span class="truncate">{{ e.name }}</span>
-          <span v-if="e.kind === 'file'" class="ml-auto shrink-0 text-on-surface-muted">{{ formatBytes(e.size) }}</span>
+          <span class="ml-auto shrink-0 text-on-surface-muted tabular-nums">{{ e.kind === "file" ? formatBytes(e.size) : "" }}</span>
+          <span class="hidden lg:inline shrink-0 w-32 text-right text-[13px] text-on-surface-muted tabular-nums">{{ formatModified(e.modified, locale) }}</span>
         </button>
       </template>
     </div>
@@ -235,7 +292,7 @@ async function onDrop() {
     <ConfirmDialog
       :open="toDelete !== null"
       :title="t('dialog.deleteTitle')"
-      :description="toDelete ? `${toDelete.name} — ${t('dialog.deleteDescription')}` : t('dialog.deleteDescription')"
+      :description="deleteDescription"
       :confirm-label="t('form.delete')"
       :cancel-label="t('form.cancel')"
       variant="danger"

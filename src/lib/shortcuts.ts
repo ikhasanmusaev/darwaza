@@ -3,6 +3,7 @@ import { useSessionsStore } from "../stores/sessions";
 import { useCommandPaletteStore } from "../stores/command-palette";
 import { useLayoutStore } from "../stores/layout";
 import { nextTick } from "vue";
+import { isAppMod, isMacOS } from "./platform";
 
 /**
  * Глобальные горячие клавиши вкладок (#054).
@@ -18,6 +19,11 @@ import { nextTick } from "vue";
  * - Ctrl+Shift+D/E    — разделить активную панель вправо/вниз (до 4 панелей).
  * - Alt+←/→           — предыдущая/следующая вкладка по кругу.
  * - Alt+↑/↓           — при разделении экрана фокус между панелями, иначе как ←/→.
+ *
+ * На macOS вместо Ctrl везде Cmd (⌘T, ⌘W, ⌘K, ⌘1..9, ⇧⌘D/E), а Ctrl остаётся
+ * оболочке. Вкладки там ещё ⇧⌘[ и ⇧⌘], как в браузерах, а Ctrl+Tab — как
+ * везде. Стрелки — ⌥⌘: голый Option со стрелкой в системе двигает курсор по
+ * словам, и в терминале, и в полях ввода, отнимать его нельзя.
  * Привязка к `e.code`, а не к `e.key`: не зависит от раскладки.
  */
 export function useGlobalShortcuts() {
@@ -64,12 +70,40 @@ export function useGlobalShortcuts() {
 
   function handler(e: KeyboardEvent) {
     // Alt+стрелки — до xterm, иначе они уйдут в оболочку ESC-последовательностью.
-    if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && altArrows(e)) {
+    const arrowMods = isMacOS()
+      ? e.altKey && e.metaKey && !e.ctrlKey && !e.shiftKey
+      : e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey;
+    if (arrowMods && altArrows(e)) {
       e.preventDefault();
       e.stopPropagation();
       return;
     }
-    if (!e.ctrlKey || e.altKey || e.metaKey) return;
+
+    // Ctrl+Tab / Ctrl+Shift+Tab — следующая/предыдущая. На всех системах:
+    // на Mac ⌘Tab занят системой, а Ctrl+Tab оболочке не нужен.
+    if (e.ctrlKey && !e.altKey && !e.metaKey && e.code === "Tab") {
+      e.preventDefault();
+      e.stopPropagation();
+      move(tabOrder(), e.shiftKey ? -1 : 1);
+      return;
+    }
+
+    // ⇧⌘[ и ⇧⌘] — привычные на Mac «предыдущая/следующая вкладка».
+    if (
+      isMacOS() &&
+      e.metaKey &&
+      e.shiftKey &&
+      !e.ctrlKey &&
+      !e.altKey &&
+      (e.code === "BracketLeft" || e.code === "BracketRight")
+    ) {
+      e.preventDefault();
+      e.stopPropagation();
+      move(tabOrder(), e.code === "BracketLeft" ? -1 : 1);
+      return;
+    }
+
+    if (!isAppMod(e) || e.altKey) return;
 
     // Ctrl+Shift+D — разделить активную панель вправо, Ctrl+Shift+E — вниз.
     if (e.shiftKey && (e.code === "KeyD" || e.code === "KeyE")) {
@@ -94,20 +128,6 @@ export function useGlobalShortcuts() {
       if (sessions.activeSessionId) {
         void sessions.close(sessions.activeSessionId);
       }
-      return;
-    }
-
-    // Ctrl+Tab / Ctrl+Shift+Tab — следующая/предыдущая
-    if (e.code === "Tab") {
-      e.preventDefault();
-      e.stopPropagation();
-      const order = tabOrder();
-      const i = order.indexOf(sessions.activeSessionId);
-      const idx = i < 0 ? 0 : i;
-      const next = e.shiftKey
-        ? (idx - 1 + order.length) % order.length
-        : (idx + 1) % order.length;
-      sessions.setActive(order[next]);
       return;
     }
 

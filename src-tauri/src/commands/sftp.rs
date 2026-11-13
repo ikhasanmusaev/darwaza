@@ -6,7 +6,9 @@
 use crate::sftp::{join_path, parent_path, sort_entries, SftpEntry};
 use crate::ssh::session::SessionCmd;
 use crate::AppState;
+use base64::Engine;
 use russh_sftp::client::SftpSession;
+use russh_sftp::protocol::{FileAttributes, OpenFlags};
 use std::sync::Arc;
 use tauri::State;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -212,6 +214,77 @@ pub async fn sftp_upload(
 
     info!(target: "sftp", "session {session_id}: uploaded {remote_path} ({total} bytes)");
     Ok(total)
+}
+
+/// Больше не передаём: снимок экрана столько не весит, а в base64 всё это ещё и
+/// проходит через память приложения целиком.
+const MAX_CLIPBOARD_IMAGE: usize = 32 * 1024 * 1024;
+
+/// Имя файла для картинки из буфера. Случайное: в `/tmp` его не должны угадать.
+fn clipboard_image_name() -> String {
+    format!("darwaza-paste-{}.png", Uuid::new_v4())
+}
+
+/// Создать файл только для владельца. Не через `sftp.create`: тот создаёт его с
+/// правами по умолчанию, и снимок экрана в `/tmp` смог бы прочитать любой
+/// пользователь сервера. `EXCLUDE` не даёт пройти по подложенной ссылке.
+async fn create_private(
+    sftp: &SftpSession,
+    path: &str,
+) -> Result<russh_sftp::client::fs::File, russh_sftp::client::error::Error> {
+    let attributes = FileAttributes {
+        permissions: Some(0o600),
+        ..FileAttributes::default()
+    };
+    sftp.open_with_flags_and_attributes(
+        path,
+        OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+        attributes,
+    )
+    .await
+}
+
+/// Передать картинку из буфера на сервер и вернуть путь к файлу (Ctrl+V).
+///
+/// Claude Code и другие программы на сервере читают буфер сервера, а картинка
+/// лежит в буфере этого компьютера. Поэтому файл кладём на сервер, а программе
+/// вставляем путь. Если `/tmp` нет или он закрыт, файл ложится в домашний каталог.
+#[tauri::command]
+pub async fn sftp_put_clipboard_image(
+    state: State<'_, AppState>,
+    session_id: Uuid,
+    data: String,
+) -> Result<String, String> {
+    let image = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(map_err)?;
+    if image.len() > MAX_CLIPBOARD_IMAGE {
+        return Err(map_err(format!(
+            "картинка {} байт больше предела {MAX_CLIPBOARD_IMAGE}",
+            image.len()
+        )));
+    }
+
+    let sftp = sftp_for(&state, session_id).await?;
+    let name = clipboard_image_name();
+    let tmp_path = join_path("/tmp", &name);
+    let (path, mut remote) = match create_private(&sftp, &tmp_path).await {
+        Ok(file) => (tmp_path, file),
+        Err(e) => {
+            warn!(target: "sftp", "session {session_id}: /tmp недоступен: {e}");
+            let home = sftp.canonicalize(".").await.map_err(map_err)?;
+            let home_path = join_path(&home, &name);
+            let file = create_private(&sftp, &home_path).await.map_err(map_err)?;
+            (home_path, file)
+        }
+    };
+
+    remote.write_all(&image).await.map_err(map_err)?;
+    remote.flush().await.map_err(map_err)?;
+    remote.shutdown().await.map_err(map_err)?;
+
+    info!(target: "sftp", "session {session_id}: clipboard image {path} ({} bytes)", image.len());
+    Ok(path)
 }
 
 /// Закрыть SFTP-подсистему, не трогая саму SSH-сессию и терминал.

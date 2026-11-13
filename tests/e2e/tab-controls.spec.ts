@@ -96,6 +96,33 @@ test.describe("S209 — управление вкладками", () => {
     await expect(page.getByTestId("library-tab")).toHaveClass(/bg-surface-alt/);
   });
 
+  test("сервер перестал отвечать — подпись красная, а не «подключено»", async ({ page }) => {
+    let answer = true;
+    await mockTauriInvoke(page, {
+      ...makeHandlers(),
+      ssh_latency: () => {
+        if (!answer) throw new Error("SSH_TIMED_OUT");
+        return 850;
+      },
+    });
+    await page.goto("/hosts");
+    await openHost(page, "alpha", 1);
+    await emitTauriEvent(page, "session:status", {
+      sessionId: "tabs-session-1",
+      status: "CONNECTED",
+      error: null,
+    });
+
+    const label = page.getByTestId("connection-latency");
+    // 850 ms — печатать можно, но заметно медленно.
+    await expect(label).toHaveAttribute("data-quality", "slow");
+    await expect(label).toContainText("850 ms");
+
+    answer = false;
+    await expect(label).toHaveAttribute("data-quality", "bad", { timeout: 10_000 });
+    await expect(label).toContainText("Server javob bermayapti");
+  });
+
   test("средняя кнопка мыши закрывает вкладку", async ({ page }) => {
     await mockTauriInvoke(page, makeHandlers());
     await page.goto("/hosts");
@@ -267,6 +294,84 @@ test.describe("копирование и вставка: Ctrl+Shift+C/V, Ctrl+In
     await expect.poll(() => JSON.stringify(sent)).toBe(JSON.stringify(["\u0016"]));
     await page.waitForTimeout(500);
     expect(sent.join("")).toBe("\u0016");
+  });
+
+  /** OSC 52 с текстом: так просят записать в буфер Claude Code, tmux и vim. */
+  const osc52 = (page: import("@playwright/test").Page, pd: string) =>
+    emitTauriEvent(page, "session:data", {
+      event: "data",
+      sessionId: "tabs-session-1",
+      chunk: Array.from(new TextEncoder().encode(`\x1b]52;c;${pd}\x07`)),
+    });
+  const base64 = (text: string) => Buffer.from(text, "utf8").toString("base64");
+
+  test("OSC 52 из программы на сервере попадает в буфер; кириллица", async ({ page, context }) => {
+    await ready(page, context, []);
+    await osc52(page, base64("из Claude Code"));
+    await expect.poll(() => copies(page)).toEqual(["из Claude Code"]);
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe("из Claude Code");
+  });
+
+  test("OSC 52: сервер не может прочитать буфер, а пустой текст его не стирает", async ({ page, context }) => {
+    const sent: string[] = [];
+    await ready(page, context, sent);
+    await page.evaluate(() => navigator.clipboard.writeText("секрет"));
+    await page.evaluate(() => ((window as unknown as { __copies: string[] }).__copies = []));
+    await osc52(page, "?");
+    await osc52(page, "");
+    await osc52(page, "не base64!");
+    await page.waitForTimeout(300);
+    expect(await copies(page)).toEqual([]);
+    expect(sent.join("")).not.toContain(base64("секрет"));
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe("секрет");
+  });
+
+  test("OSC 52 от терминала без фокуса буфер не меняет", async ({ page, context }) => {
+    await ready(page, context, []);
+    await page.locator(".xterm-helper-textarea").last().blur();
+    await osc52(page, base64("чужое"));
+    await page.waitForTimeout(300);
+    expect(await copies(page)).toEqual([]);
+  });
+
+  async function readyWithImage(
+    page: import("@playwright/test").Page,
+    sent: string[],
+    put: (args?: any) => unknown,
+  ) {
+    await mockTauriInvoke(page, {
+      ...makeHandlers(sent),
+      clipboard_read_image: () => "cG5n",
+      sftp_put_clipboard_image: put,
+    });
+    await page.goto("/hosts");
+    await openHost(page, "alpha", 1);
+    await emitTauriEvent(page, "session:status", { sessionId: "tabs-session-1", status: "CONNECTED", error: null });
+    await page.locator(".xterm-helper-textarea").last().focus();
+  }
+
+  test("Ctrl+V с картинкой передаёт её на сервер и вставляет путь вместо ^V", async ({ page }) => {
+    const sent: string[] = [];
+    const uploads: unknown[] = [];
+    await readyWithImage(page, sent, (args) => {
+      uploads.push(args);
+      return "/tmp/darwaza-paste-1.png";
+    });
+    await page.keyboard.press("Control+KeyV");
+    await expect.poll(() => sent.join("")).toContain("/tmp/darwaza-paste-1.png");
+    expect(uploads).toEqual([{ sessionId: "tabs-session-1", data: "cG5n" }]);
+    expect(sent.join("")).not.toContain("\u0016");
+    await expect(page.getByTestId("image-paste-notice")).toHaveCount(0);
+  });
+
+  test("если картинка не передалась, человек видит сообщение, а в терминал ничего не уходит", async ({ page }) => {
+    const sent: string[] = [];
+    await readyWithImage(page, sent, () => {
+      throw new Error("errors.unexpected");
+    });
+    await page.keyboard.press("Control+KeyV");
+    await expect(page.getByTestId("image-paste-notice")).toBeVisible();
+    expect(sent.join("")).toBe("");
   });
 
   test("Ctrl+Insert копирует выделение и не уходит в оболочку", async ({ page, context }) => {
@@ -590,5 +695,57 @@ test.describe("S216 — агент открывает вкладку с кома
     // на сервере не происходит ничего.
     expect(sent.join("")).not.toContain("\n");
     expect(sent.join("")).not.toContain("\r");
+  });
+});
+
+test.describe("macOS: сочетания на Cmd, Ctrl и Option остаются оболочке", () => {
+  test.use({
+    userAgent:
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)",
+  });
+
+  async function twoConnected(page: any, sent: string[]) {
+    await mockTauriInvoke(page, makeHandlers(sent));
+    await page.goto("/hosts");
+    await openHost(page, "alpha", 1);
+    await openHost(page, "beta", 2);
+    for (const id of ["tabs-session-1", "tabs-session-2"]) {
+      await emitTauriEvent(page, "session:status", { sessionId: id, status: "CONNECTED", error: null });
+    }
+    await expect(page.locator(".xterm").nth(1)).toBeVisible();
+    await page.locator(".xterm-helper-textarea").last().focus();
+  }
+
+  test("⌘W закрывает вкладку, а Ctrl+W уходит в оболочку стирать слово", async ({ page }) => {
+    const sent: string[] = [];
+    await twoConnected(page, sent);
+
+    await page.keyboard.press("Control+w");
+    await expect(page.getByTestId("session-tab")).toHaveCount(2);
+    expect(sent.join("")).toContain("\u0017");
+
+    await page.keyboard.press("Meta+w");
+    await expect(page.getByTestId("session-tab")).toHaveCount(1);
+  });
+
+  test("Option+стрелки не переключают вкладки, ⌥⌘стрелки и ⇧⌘] — переключают", async ({ page }) => {
+    const sent: string[] = [];
+    await twoConnected(page, sent);
+    const terminals = page.locator(".xterm");
+
+    await page.keyboard.press("Alt+ArrowLeft");
+    await expect(terminals.nth(1)).toBeVisible();
+
+    await page.keyboard.press("Alt+Meta+ArrowRight"); // последняя → Kutubxona
+    await expect(terminals.nth(1)).toBeHidden();
+    await page.keyboard.press("Meta+Shift+BracketRight"); // → первая
+    await expect(terminals.nth(0)).toBeVisible();
+  });
+
+  test("⌘K открывает палитру, подсказка на кнопке — ⌘K", async ({ page }) => {
+    await twoConnected(page, []);
+    await expect(page.getByTestId("palette-open")).toContainText("⌘K");
+    await page.keyboard.press("Meta+k");
+    await expect(page.getByRole("dialog")).toBeVisible();
   });
 });

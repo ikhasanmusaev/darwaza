@@ -4,10 +4,10 @@ name = "darwaza"
 # строки `cargo run` не знает, какую запускать, и падает — а `tauri dev`
 # зовёт именно его.
 default-run = "darwaza"
-version = "0.1.1"
+version = "0.1.2"
 description = "Darwaza — local-first SSH client"
 license = "GPL-3.0-or-later"
-authors = ["Khasan Musaev <contact@darwaza.uz>"]
+authors = ["Ikhasan Musaev <contact@darwaza.uz>"]
 edition = "2021"
 
 [lib]
@@ -135,5 +135,24 @@ windows-sys = { version = "0.61", features = [
 [target.'cfg(target_os = "macos")'.dependencies]
 # Keychain — то же самое на macOS.
 keyring = { version = "3.6", features = ["apple-native"] }
+# Буфер обмена читаем через NSPasteboard, а не через WebView: страница живёт
+# на схеме tauri://, и `navigator.clipboard` там либо просит разрешения, либо
+# отсутствует, а `clipboard.read()` для картинок не работает и с ним.
+# См. commands/clipboard.rs. Версии те же, что тянет tauri, — второго objc2
+# в сборку не попадает.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+  "std",
+  "NSPasteboard",
+  "NSBitmapImageRep",
+  "NSImageRep",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+  "std",
+  "NSArray",
+  "NSData",
+  "NSDictionary",
+  "NSString",
+] }
 
 [dev-dependencies]

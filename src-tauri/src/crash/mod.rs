@@ -44,7 +44,7 @@ pub fn is_enabled() -> bool {
 
 pub fn crashes_dir() -> Result<PathBuf> {
     let dir = crate::paths::state_dir()?.join("crashes");
-    std::fs::create_dir_all(&dir).with_context(|| format!("создание {}", dir.display()))?;
+    crate::paths::ensure_private_tree(&dir)?;
     Ok(dir)
 }
 

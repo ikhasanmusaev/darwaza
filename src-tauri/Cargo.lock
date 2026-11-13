@@ -1031,7 +1031,7 @@ dependencies = [
 
 [[package]]
 name = "darwaza"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes-gcm 0.11.0",
  "anyhow",
@@ -1045,6 +1045,9 @@ dependencies = [
  "hmac",
  "keyring",
  "libc",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "once_cell",
  "portable-pty",
  "reqwest",

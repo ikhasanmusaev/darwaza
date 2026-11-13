@@ -15,6 +15,38 @@ The version is declared in four places — `package.json`,
 `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and here;
 `scripts/check-versions.sh` compares them.
 
+## [0.1.2] — 2026-11-14
+
+### Added
+
+- **Darwaza for macOS.** One download works on both Apple Silicon and Intel Macs. The app is signed with a Developer ID and notarized by Apple, so it opens without the “unidentified developer” warning: open the `.dmg` and drag Darwaza into Applications. Updates on a Mac arrive the same way as on Linux.
+- **When a name is already taken, the app asks what to do: replace, keep both or skip.** For a folder, replace means merge: files with the same names are replaced, everything else in it stays. “Keep both” is the default, so Enter never overwrites anything, and with several clashes you can answer once for all of them. A replaced file is written next to the old one first and swapped in only when it has arrived whole: a broken connection or Cancel leaves the old file as it was.
+- **Several files at once in both file panels:** Ctrl+click (⌘ on Mac) adds an item, Shift+click selects a range. The selected items are transferred, dragged and deleted together; deleting asks once for all of them.
+- **The file panel in a terminal tab transfers folders, shows progress and can be stopped.** The arrow buttons used to copy one file at a time behind a spinner, could not take a folder, and overwrote a file of the same name. Now buttons, dragging between the sides and dropping from your file manager all go through the transfer bar at the bottom: a folder goes whole, and a name that is already taken is asked about. Both sides refresh when a transfer finishes.
+- **File panels: hidden files, dates, permissions, filter and copy path.** A button hides or shows names starting with a dot, in both file panels. Rows show when the file was changed, and the side panel also shows `rwxr-xr-x` on a wide window; hover a row to see both. The server side has a name filter and a button that copies the selected item's path, or the open folder's.
+- **A link to a folder opens with a double click,** for instance `/var/www` when it is a link. A link to a file is left alone.
+- **Ctrl+V with an image in the clipboard works in programs on a server, Claude Code included.** The image goes to the server over SFTP as a file only you can read, and its path is pasted. Such a program only sees the server's clipboard, so a picture from your computer never reached it. Without an image Ctrl+V still sends `^V`; files stay in the server's `/tmp` until it clears them.
+
+### Changed
+
+- **The label next to the tabs shows when the network is bad, not just that you are connected.** It stays green while the server answers quickly, turns orange when replies take 300 ms or more or one check gets no answer, and red at 1.5 s or when the server stops answering — then it reads “Server not responding…”. Before, it said “Connected” in green even with the network gone, until the connection finally dropped. A bad link is rechecked every two seconds, so you see it come back sooner.
+
+### Fixed
+
+- **Deleting a non-empty folder explains why it did not work,** and in the Files screen an error after creating, renaming or deleting no longer vanishes the moment the list refreshes.
+- **Uploading a file whose name already exists on the server no longer destroys the old one.** A file dropped onto the server replaced the one with the same name, and cancelling or a broken connection then deleted the half-uploaded copy — so the original was gone entirely. Now the upload gets the next free name, `report (2).txt`, as downloads already did.
+- **On macOS the app's shortcuts use Cmd, as in every Mac app:** ⌘T, ⌘W, ⌘K, ⌘F, ⌘1…9, ⇧⌘D/⇧⌘E, ⇧⌘B, and tabs also switch with ⇧⌘[ and ⇧⌘]. Ctrl is left to the shell, so Ctrl+W, Ctrl+K and Ctrl+F do what they do in a terminal. Option+arrows move by words again, in the terminal and in input fields; tabs and panes switch with ⌥⌘+arrows instead. ⌘W closes the tab, not the whole window with every session in it. Hints in menus show the Mac symbols.
+- **Copying from Claude Code in fullscreen, tmux and vim with the mouse now reaches your clipboard.** These programs send the text with OSC 52, which the terminal ignored. Only writing is accepted, and only while that terminal has focus: a server cannot read your clipboard.
+- **Ctrl+Shift+C on Linux writes to the system clipboard directly,** and a failed copy goes to the log instead of vanishing.
+- **On a slow network, closing a tab, typing and server output no longer wait for the latency check.** The `ms` next to the tab was measured inside the same queue that handles everything else, so on a lossy link each check paused the session for up to three seconds. Checks, SFTP, agent commands and port forwards now run beside the terminal, and saying goodbye to a server that does not answer takes at most a second.
+- **Option works as Meta in the terminal on macOS.** `Option+b` and `Option+f` — word back and word forward in the shell — sent a special character instead of an escape sequence, so moving by words did nothing. In exchange, typing special characters with Option (`Option+e` for “é”, say) no longer works inside the terminal.
+- **Cmd+C copies the terminal selection on macOS.** Only Ctrl+Shift+C and Ctrl+Insert did, and the system shortcut did nothing: the terminal keeps its selection apart from the page, so there was nothing for the system to copy. With nothing selected the keystroke is left alone, so copying in input fields is unchanged. Cmd+V already pasted and is untouched.
+- **The clipboard works in the terminal on macOS, and asks for nothing.** Reading and writing now go through the system clipboard (NSPasteboard) instead of the page: on the app's own scheme `navigator.clipboard` either wants permission or is missing, and it never hands over an image at all — so Ctrl+V with a screenshot in the clipboard could not reach a server. An image copied as TIFF is converted to PNG. Text lying next to an image still counts as text: only a picture goes to a server.
+
+### Security
+
+- **On Linux, other users of the computer can no longer read the app's log or crash reports.** The folders were open for reading (`0755`) and the log files too (`0644`), and the log holds host names, addresses and paths. Now the folders are `0700` and the files `0600`, including those already written.
+
 ## [0.1.1] — 2026-11-05
 
 ### Added

@@ -7,6 +7,7 @@ import TabsBar from "./TabsBar.vue";
 import TerminalPane from "./TerminalPane.vue";
 import HostKeyPromptDialog from "./HostKeyPromptDialog.vue";
 import CommandPalette from "./CommandPalette.vue";
+import ConflictDialog from "./ConflictDialog.vue";
 import SftpPanel from "./SftpPanel.vue";
 import MasterUnlockGate from "./MasterUnlockGate.vue";
 import StartupFailureGate from "./StartupFailureGate.vue";
@@ -307,6 +308,8 @@ const sftpVisible = computed(
 
     <!-- Command Palette — Ctrl+K (#142) -->
     <CommandPalette />
+    <!-- «Такое имя уже есть» перед передачей файлов -->
+    <ConflictDialog />
 
     <OnboardingGate />
 

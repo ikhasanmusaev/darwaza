@@ -170,6 +170,43 @@ async fn sftp_full_cycle_against_real_sshd() {
         .expect("disconnect");
 }
 
+/// Картинка из буфера на сервере: те же флаги и права, что в
+/// `commands/sftp.rs::create_private`. Снимок экрана в `/tmp` не должен читаться
+/// другими пользователями, а подложенный заранее файл нельзя перезаписать.
+#[tokio::test]
+#[ignore = "требует локальный sshd на 2222 — см. docs/05-manual-testing/ssh-live-test.md"]
+async fn clipboard_image_file_is_private_and_exclusive() {
+    use russh_sftp::protocol::FileAttributes;
+
+    let session = connect().await;
+    let sftp = open_sftp(&session).await;
+    let path = format!("/tmp/darwaza-live-paste-{}.png", std::process::id());
+    let attributes = || FileAttributes {
+        permissions: Some(0o600),
+        ..FileAttributes::default()
+    };
+    let flags = OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE;
+
+    let mut file = sftp
+        .open_with_flags_and_attributes(path.clone(), flags, attributes())
+        .await
+        .expect("create");
+    file.write_all(b"png").await.expect("write");
+    file.shutdown().await.expect("close");
+
+    let meta = sftp.metadata(path.clone()).await.expect("metadata");
+    assert_eq!(meta.permissions.expect("permissions") & 0o777, 0o600);
+    assert_eq!(meta.size, Some(3));
+    assert!(
+        sftp.open_with_flags_and_attributes(path.clone(), flags, attributes())
+            .await
+            .is_err(),
+        "существующий файл перезаписываться не должен"
+    );
+
+    sftp.remove_file(path).await.expect("cleanup");
+}
+
 /// SFTP-канал не должен мешать терминалу: оба живут на одной SSH-сессии.
 /// Заодно проверяется путь сниппета — это тот же `ssh_send` с `\n` на конце.
 #[tokio::test]
@@ -1042,7 +1079,7 @@ async fn copying_between_servers_moves_the_whole_file() {
 #[tokio::test]
 #[ignore = "требует локальный sshd на 2222 — scripts/live-sshd.sh"]
 async fn folders_travel_whole_in_every_direction() {
-    use darwaza_lib::transfers::tree::{copy_tree, LocalTree, Outcome, RemoteTree};
+    use darwaza_lib::transfers::tree::{copy_tree, LocalTree, OnConflict, Outcome, RemoteTree};
     use std::sync::atomic::AtomicBool;
 
     let a_session = connect().await;
@@ -1076,6 +1113,7 @@ async fn folders_travel_whole_in_every_direction() {
         true,
         &RemoteTree(a.clone()),
         &remote_a,
+        OnConflict::Rename,
         &no_cancel,
         &mut quiet,
     )
@@ -1093,6 +1131,7 @@ async fn folders_travel_whole_in_every_direction() {
         true,
         &RemoteTree(b.clone()),
         &remote_b,
+        OnConflict::Rename,
         &no_cancel,
         &mut quiet,
     )
@@ -1116,6 +1155,7 @@ async fn folders_travel_whole_in_every_direction() {
             true,
             &LocalTree,
             &down_dir.to_string_lossy(),
+            OnConflict::Rename,
             &no_cancel,
             &mut quiet,
         )

@@ -52,8 +52,9 @@ export const useTransfersStore = defineStore("transfers", () => {
     isDir: boolean,
     target: TreeEndpoint,
     targetDir: string,
+    onConflict: "rename" | "replace" = "rename",
   ): Promise<string> {
-    return transfersApi.tree(source, sourcePath, isDir, target, targetDir);
+    return transfersApi.tree(source, sourcePath, isDir, target, targetDir, onConflict);
   }
 
   async function cancel(id: string): Promise<void> {

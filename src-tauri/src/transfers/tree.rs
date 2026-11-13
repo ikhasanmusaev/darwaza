@@ -6,8 +6,11 @@
 //! без промежуточных файлов на диске.
 //!
 //! Правила, ради которых это написано так, а не проще:
-//! - **ничего не затирается**: верхняя папка (или файл) получает свободное имя
-//!   `имя (2)`, а всё внутри кладётся в только что созданное место;
+//! - **ничего не затирается без спроса**: по умолчанию верхняя папка (или файл)
+//!   получает свободное имя `имя (2)`, а всё внутри кладётся в только что
+//!   созданное место. Заменить можно только явно (`OnConflict::Replace`), и тогда
+//!   новый файл сначала целиком пишется рядом во временный, а прежний
+//!   подменяется им в самом конце: обрыв или отмена прежний файл не трогают;
 //! - **символические ссылки не обходятся и не копируются**: по ссылке можно
 //!   выйти из выбранной папки (на `/` или в чужой каталог), а копия ссылки
 //!   на другом конце означала бы совсем другое;
@@ -25,6 +28,18 @@ const CHUNK: usize = 32 * 1024;
 /// приложение и забить диск.
 const MAX_ENTRIES: usize = 200_000;
 const MAX_DEPTH: usize = 64;
+
+/// Что делать, если в папке назначения уже есть запись с таким именем.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnConflict {
+    /// Положить рядом под свободным именем `имя (2)`.
+    #[default]
+    Rename,
+    /// Файл заменить, папку слить: что совпало по имени — заменить, остальное
+    /// в ней не трогать.
+    Replace,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
@@ -52,6 +67,9 @@ pub trait TreeFs: Send + Sync {
     async fn open_read(&self, path: &str) -> Result<Box<dyn AsyncRead + Unpin + Send>, String>;
     async fn create_write(&self, path: &str) -> Result<Box<dyn AsyncWrite + Unpin + Send>, String>;
     async fn remove_file(&self, path: &str) -> Result<(), String>;
+    /// Поставить готовый `tmp` на место `target`, который уже есть. Прежний
+    /// файл должен остаться целым, если подменить не вышло.
+    async fn replace_with(&self, tmp: &str, target: &str) -> Result<(), String>;
 }
 
 /// Ошибка с путём, на котором остановились.
@@ -96,6 +114,21 @@ fn join_rel(rel: &str, name: &str) -> String {
     } else {
         format!("{rel}/{name}")
     }
+}
+
+/// Папка и имя записи относительно `top`: `a/b/two.txt` → (`top/a/b`, `two.txt`).
+fn split_target(fs: &dyn TreeFs, top: &str, rel: &str) -> (String, String) {
+    match rel.rsplit_once('/') {
+        Some((dir, name)) => (under(fs, top, dir), name.to_string()),
+        None => (top.to_string(), rel.to_string()),
+    }
+}
+
+/// Имя временного файла рядом с заменяемым: скрытое и с меткой, чтобы
+/// оставшееся после сбоя питания было видно, чьё оно.
+fn temp_name(name: &str) -> String {
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    format!(".{name}.{}.darwaza-part", &tag[..8])
 }
 
 /// Обход источника: сколько папок, файлов и байт. Ссылки пропускаются.
@@ -196,6 +229,7 @@ pub async fn copy_tree(
     is_dir: bool,
     dst: &dyn TreeFs,
     dst_dir: &str,
+    on_conflict: OnConflict,
     cancel: &AtomicBool,
     on_progress: &mut (dyn FnMut(Progress) + Send),
 ) -> Result<Outcome, TreeError> {
@@ -217,19 +251,46 @@ pub async fn copy_tree(
     };
     let total: u64 = plan.files.iter().map(|(_, s)| *s).sum();
 
-    let top_name = free_name(dst, dst_dir, name)
-        .await
-        .map_err(|message| TreeError { path: name.into(), message })?;
-    let top = dst.join(dst_dir, &top_name);
+    let top_err = |message: String| TreeError { path: name.into(), message };
+    // `merging` — кладём поверх того, что уже лежит под этим именем.
+    let (top, merging) = match on_conflict {
+        OnConflict::Rename => {
+            let free = free_name(dst, dst_dir, name).await.map_err(top_err)?;
+            (dst.join(dst_dir, &free), false)
+        }
+        OnConflict::Replace => {
+            let top = dst.join(dst_dir, name);
+            match dst.kind_of(&top).await.map_err(top_err)? {
+                None => (top, false),
+                Some((NodeKind::Dir, _)) if is_dir => (top, true),
+                Some((NodeKind::File, _)) if !is_dir => (top, true),
+                Some(_) => {
+                    return Err(top_err(if is_dir {
+                        "на месте папки лежит файл с тем же именем".into()
+                    } else {
+                        "на месте файла лежит папка с тем же именем".into()
+                    }))
+                }
+            }
+        }
+    };
 
     if is_dir {
-        dst.mkdir(&top)
-            .await
-            .map_err(|message| TreeError { path: name.into(), message })?;
+        if !merging {
+            dst.mkdir(&top).await.map_err(top_err)?;
+        }
         for rel in &plan.dirs {
-            dst.mkdir(&under(dst, &top, rel))
-                .await
-                .map_err(|message| TreeError { path: rel.clone(), message })?;
+            let path = under(dst, &top, rel);
+            let rel_err = |message: String| TreeError { path: rel.clone(), message };
+            if merging {
+                match dst.kind_of(&path).await.map_err(rel_err)? {
+                    None => dst.mkdir(&path).await.map_err(rel_err)?,
+                    Some((NodeKind::Dir, _)) => {}
+                    Some(_) => return Err(rel_err("на месте папки лежит файл с тем же именем".into())),
+                }
+            } else {
+                dst.mkdir(&path).await.map_err(rel_err)?;
+            }
         }
     }
 
@@ -247,14 +308,45 @@ pub async fn copy_tree(
                 current: current.clone(),
             });
         };
-        match copy_file(src, &from, dst, &to, cancel, &mut transferred, &mut tick).await {
-            Ok(true) => copied += 1,
+        // Заменяем, только если файл там правда есть: остальное пишется как обычно.
+        let replacing = merging
+            && match dst.kind_of(&to).await {
+                Ok(None) => false,
+                Ok(Some((NodeKind::File, _))) => true,
+                Ok(Some(_)) => {
+                    return Err(TreeError {
+                        path: shown,
+                        message: "на месте файла лежит папка с тем же именем".into(),
+                    })
+                }
+                Err(message) => return Err(TreeError { path: shown, message }),
+            };
+        let write_to = if replacing {
+            let (dir, file) = if is_dir {
+                split_target(dst, &top, rel)
+            } else {
+                (dst_dir.to_string(), name.to_string())
+            };
+            dst.join(&dir, &temp_name(&file))
+        } else {
+            to.clone()
+        };
+        match copy_file(src, &from, dst, &write_to, cancel, &mut transferred, &mut tick).await {
+            Ok(true) => {
+                if replacing {
+                    if let Err(message) = dst.replace_with(&write_to, &to).await {
+                        dst.remove_file(&write_to).await.ok();
+                        return Err(TreeError { path: shown, message });
+                    }
+                }
+                copied += 1;
+            }
             Ok(false) => {
-                dst.remove_file(&to).await.ok();
+                dst.remove_file(&write_to).await.ok();
                 return Ok(Outcome::Cancelled { files: copied });
             }
             Err(message) => {
-                dst.remove_file(&to).await.ok();
+                dst.remove_file(&write_to).await.ok();
                 return Err(TreeError { path: shown, message });
             }
         }
@@ -332,6 +424,12 @@ impl TreeFs for LocalTree {
     async fn remove_file(&self, path: &str) -> Result<(), String> {
         tokio::fs::remove_file(path).await.map_err(|e| e.to_string())
     }
+
+    async fn replace_with(&self, tmp: &str, target: &str) -> Result<(), String> {
+        // `rename` поверх существующего файла заменяет его одним шагом и на
+        // unix, и на Windows (MoveFileEx с заменой).
+        tokio::fs::rename(tmp, target).await.map_err(|e| e.to_string())
+    }
 }
 
 /// Сервер по SFTP.
@@ -391,12 +489,49 @@ impl TreeFs for RemoteTree {
     }
 
     async fn create_write(&self, path: &str) -> Result<Box<dyn AsyncWrite + Unpin + Send>, String> {
-        let f = self.0.create(path.to_string()).await.map_err(|e| e.to_string())?;
+        // Только новый файл, как и на компьютере: если он появился между
+        // проверкой имени и записью, лучше отказ, чем затирание.
+        use russh_sftp::protocol::OpenFlags;
+        let flags = OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE;
+        let f = self
+            .0
+            .open_with_flags(path.to_string(), flags)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(Box::new(f))
     }
 
     async fn remove_file(&self, path: &str) -> Result<(), String> {
         self.0.remove_file(path.to_string()).await.map_err(|e| e.to_string())
+    }
+
+    async fn replace_with(&self, tmp: &str, target: &str) -> Result<(), String> {
+        // SFTP v3 не переименовывает поверх существующего файла. Поэтому
+        // прежний сначала отходит в сторону, новый встаёт на его место, и
+        // только потом прежний удаляется. Не встал — прежний возвращается.
+        let aside = format!("{target}.darwaza-old");
+        if self.0.try_exists(aside.clone()).await.unwrap_or(false) {
+            self.0
+                .remove_file(aside.clone())
+                .await
+                .map_err(|e| format!("{aside}: {e}"))?;
+        }
+        self.0
+            .rename(target.to_string(), aside.clone())
+            .await
+            .map_err(|e| format!("не удалось отложить прежний файл: {e}"))?;
+        if let Err(e) = self.0.rename(tmp.to_string(), target.to_string()).await {
+            return match self.0.rename(aside.clone(), target.to_string()).await {
+                Ok(()) => Err(format!("не удалось поставить новый файл, прежний на месте: {e}")),
+                Err(_) => Err(format!(
+                    "не удалось поставить новый файл, и прежний НЕ вернулся — он лежит в {aside}: {e}"
+                )),
+            };
+        }
+        if let Err(e) = self.0.remove_file(aside.clone()).await {
+            tracing::warn!(target: "transfers", "прежний файл остался рядом, {aside}: {e}");
+        }
+        Ok(())
     }
 }
 
@@ -435,6 +570,7 @@ mod tests {
             src.join(name).is_dir(),
             &LocalTree,
             &dst_dir.to_string_lossy(),
+            OnConflict::Rename,
             cancel,
             &mut cb,
         )
@@ -525,6 +661,7 @@ mod tests {
             true,
             &LocalTree,
             &dst.to_string_lossy(),
+            OnConflict::Rename,
             &cancel,
             &mut cb,
         )
@@ -561,6 +698,7 @@ mod tests {
             }
             async fn create_write(&self, p: &str) -> Result<Box<dyn AsyncWrite + Unpin + Send>, String> { LocalTree.create_write(p).await }
             async fn remove_file(&self, p: &str) -> Result<(), String> { LocalTree.remove_file(p).await }
+            async fn replace_with(&self, t: &str, p: &str) -> Result<(), String> { LocalTree.replace_with(t, p).await }
         }
         let dst2 = scratch("err-dst2");
         let mut cb = |_p: Progress| {};
@@ -571,6 +709,7 @@ mod tests {
             true,
             &LocalTree,
             &dst2.to_string_lossy(),
+            OnConflict::Rename,
             &AtomicBool::new(false),
             &mut cb,
         )
@@ -593,5 +732,117 @@ mod tests {
         std::fs::create_dir_all(&deep).unwrap();
         let (result, _) = run(&src, "d", &dst, &AtomicBool::new(false)).await;
         assert!(result.unwrap_err().message.contains("вложенность"));
+    }
+
+    async fn replace(src: &Path, name: &str, dst_dir: &Path) -> Result<Outcome, TreeError> {
+        let mut cb = |_p: Progress| {};
+        copy_tree(
+            &LocalTree,
+            &src.join(name).to_string_lossy(),
+            name,
+            src.join(name).is_dir(),
+            &LocalTree,
+            &dst_dir.to_string_lossy(),
+            OnConflict::Replace,
+            &AtomicBool::new(false),
+            &mut cb,
+        )
+        .await
+    }
+
+    /// Временных `.darwaza-part` после передачи остаться не должно.
+    fn no_temp_files(dir: &Path) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(!name.ends_with(".darwaza-part"), "остался временный {name}");
+            if entry.path().is_dir() {
+                no_temp_files(&entry.path());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_puts_the_new_file_in_place_of_the_old_one() {
+        let src = scratch("repl-src");
+        let dst = scratch("repl-dst");
+        std::fs::write(src.join("app.conf"), "новый").unwrap();
+        std::fs::write(dst.join("app.conf"), "старый, длиннее нового").unwrap();
+
+        let Outcome::Done { dest, .. } = replace(&src, "app.conf", &dst).await.unwrap() else {
+            panic!("не Done")
+        };
+        assert_eq!(dest, dst.join("app.conf").to_string_lossy());
+        assert_eq!(std::fs::read_to_string(dst.join("app.conf")).unwrap(), "новый");
+        assert!(!dst.join("app (2).conf").exists(), "заменить — не класть рядом");
+        no_temp_files(&dst);
+    }
+
+    #[tokio::test]
+    async fn replace_merges_a_folder_and_keeps_what_only_the_target_has() {
+        let src = scratch("merge-src");
+        let dst = scratch("merge-dst");
+        sample_tree(&src.join("proj"));
+        std::fs::create_dir_all(dst.join("proj/a")).unwrap();
+        std::fs::write(dst.join("proj/a/one.bin"), "старое").unwrap();
+        std::fs::write(dst.join("proj/a/mine.txt"), "только здесь").unwrap();
+
+        replace(&src, "proj", &dst).await.unwrap();
+
+        assert_eq!(std::fs::read(dst.join("proj/a/one.bin")).unwrap(), vec![2u8; 70_000]);
+        assert_eq!(std::fs::read_to_string(dst.join("proj/a/mine.txt")).unwrap(), "только здесь");
+        assert_eq!(std::fs::read_to_string(dst.join("proj/a/b/two.txt")).unwrap(), "два");
+        assert!(!dst.join("proj (2)").exists());
+        no_temp_files(&dst);
+    }
+
+    #[tokio::test]
+    async fn replace_refuses_to_put_a_folder_over_a_file() {
+        let src = scratch("kind-src");
+        let dst = scratch("kind-dst");
+        sample_tree(&src.join("proj"));
+        std::fs::write(dst.join("proj"), "это файл").unwrap();
+
+        let err = replace(&src, "proj", &dst).await.unwrap_err();
+        assert!(err.message.contains("файл с тем же именем"));
+        assert_eq!(std::fs::read_to_string(dst.join("proj")).unwrap(), "это файл");
+    }
+
+    #[tokio::test]
+    async fn a_failed_replace_leaves_the_old_file_untouched() {
+        let src = scratch("fail-src");
+        let dst = scratch("fail-dst");
+        std::fs::write(src.join("app.conf"), "новый").unwrap();
+        std::fs::write(dst.join("app.conf"), "старый").unwrap();
+        struct BrokenRead;
+        #[async_trait]
+        impl TreeFs for BrokenRead {
+            fn join(&self, d: &str, n: &str) -> String { LocalTree.join(d, n) }
+            async fn kind_of(&self, p: &str) -> Result<Option<(NodeKind, u64)>, String> { LocalTree.kind_of(p).await }
+            async fn list(&self, d: &str) -> Result<Vec<Node>, String> { LocalTree.list(d).await }
+            async fn mkdir(&self, p: &str) -> Result<(), String> { LocalTree.mkdir(p).await }
+            async fn open_read(&self, _p: &str) -> Result<Box<dyn AsyncRead + Unpin + Send>, String> {
+                Err("связь оборвалась".into())
+            }
+            async fn create_write(&self, p: &str) -> Result<Box<dyn AsyncWrite + Unpin + Send>, String> { LocalTree.create_write(p).await }
+            async fn remove_file(&self, p: &str) -> Result<(), String> { LocalTree.remove_file(p).await }
+            async fn replace_with(&self, t: &str, p: &str) -> Result<(), String> { LocalTree.replace_with(t, p).await }
+        }
+        let mut cb = |_p: Progress| {};
+        let err = copy_tree(
+            &BrokenRead,
+            &src.join("app.conf").to_string_lossy(),
+            "app.conf",
+            false,
+            &LocalTree,
+            &dst.to_string_lossy(),
+            OnConflict::Replace,
+            &AtomicBool::new(false),
+            &mut cb,
+        )
+        .await;
+        // kind_of источника проходит, ломается чтение — прежний файл цел.
+        assert!(err.is_err());
+        assert_eq!(std::fs::read_to_string(dst.join("app.conf")).unwrap(), "старый");
+        no_temp_files(&dst);
     }
 }

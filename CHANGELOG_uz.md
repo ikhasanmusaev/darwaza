@@ -16,6 +16,38 @@ Versiya to'rt joyda e'lon qilinadi — `package.json`,
 `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` va shu yerda;
 ularni `scripts/check-versions.sh` solishtiradi.
 
+## [0.1.2] — 2026-11-14
+
+### Qo'shildi
+
+- **macOS uchun Darwaza.** Bitta yig‘ma Apple Silicon’da ham, Intel’da ham ishlaydi. Dastur Developer ID sertifikati bilan imzolangan va Apple tomonidan tasdiqlangan, shuning uchun «noma’lum dasturchi» ogohlantirishisiz ochiladi: `.dmg` faylni oching va Darwaza’ni Applications papkasiga torting. Mac’da yangilanishlar Linux’dagidek keladi.
+- **Nom band bo‘lsa, dastur nima qilishni so‘raydi: almashtirish, ikkalasini qoldirish yoki o‘tkazib yuborish.** Papka uchun «almashtirish» birlashtirishni bildiradi: nomi bir xil fayllar almashtiriladi, qolgani joyida qoladi. Odatiy javob — «ikkalasini qoldirish», shuning uchun Enter hech narsani ustidan yozmaydi, bir nechta moslikda esa hammasiga bir marta javob berish mumkin. Almashtiriladigan fayl avval yoniga yoziladi va faqat to‘liq yetib kelgach eskisining o‘rniga turadi: aloqa uzilishi yoki «Bekor qilish» eski faylni o‘zgarishsiz qoldiradi.
+- **Ikkala fayl panelida bir nechta fayl birdaniga:** Ctrl+bosish (Mac'da ⌘) yozuv qo‘shadi, Shift+bosish oraliqni tanlaydi. Tanlanganlar birga uzatiladi, sudraladi va o‘chiriladi; o‘chirish hammasi uchun bir marta so‘raydi.
+- **Terminal varag‘idagi fayllar paneli papkalarni uzatadi, jarayonni ko‘rsatadi va to‘xtatiladi.** Strelkali tugmalar aylanuvchi belgi ostida bittadan fayl nusxalardi, papkani olmasdi, nomi bir xil faylni esa ustidan yozardi. Endi tugmalar, tomonlar orasida sudrash va fayl menejeridan tashlash pastdagi uzatishlar chizig‘i orqali ishlaydi: papka butunligicha ketadi, band nom haqida esa dastur so‘raydi. Uzatish tugagach, ikkala tomon o‘zi yangilanadi.
+- **Fayl panellari: yashirin fayllar, sanalar, huquqlar, saralash va yo‘lni nusxalash.** Tugma nuqta bilan boshlanadigan nomlarni yashiradi va ko‘rsatadi — ikkala fayl panelida. Qatorlarda fayl qachon o‘zgargani ko‘rinadi, yon panelda keng oynada esa `rwxr-xr-x` ham; qator ustiga olib borilsa, ikkalasi ham ko‘rinadi. Server tomonida nom bo‘yicha saralash va tanlangan narsa yoki ochiq papka yo‘lini nusxalaydigan tugma bor.
+- **Papkaga havola ikki marta bosish bilan ochiladi,** masalan, havola bo‘lgan `/var/www`. Faylga havolaga bosish tegmaydi.
+- **Buferda rasm bo'lsa, Ctrl+V serverdagi dasturlarda, jumladan Claude Code'da ishlaydi.** Rasm SFTP orqali serverga faqat siz o'qiy oladigan fayl bo'lib yuboriladi, dasturga esa uning yo'li qo'yiladi. Bunday dastur faqat server buferini ko'radi, shuning uchun kompyuteringizdagi rasm unga yetib bormasdi. Rasm bo'lmasa, Ctrl+V avvalgidek `^V` yuboradi; fayllar server `/tmp` ni tozalamaguncha qoladi.
+
+### O‘zgartirildi
+
+- **Varaqlar yonidagi yozuv faqat ulanganingizni emas, aloqa yomonligini ham ko‘rsatadi.** Server tez javob berayotganda u yashil; javob 300 ms va undan uzoq kelsa yoki bitta o‘lchovga javob bo‘lmasa — to‘q sariq; 1,5 soniyadan boshlab yoki server javob bermay qo‘ysa — qizil, unda «Server javob bermayapti…» deb yoziladi. Avval tarmoq yo‘qolganda ham ulanish butunlay uzilmaguncha yashil «Ulangan» turardi. Yomon aloqa har ikki soniyada tekshiriladi, shunda tiklangani tezroq ko‘rinadi.
+
+### Tuzatildi
+
+- **Bo‘sh bo‘lmagan papkani o‘chirish nima uchun bo‘lmaganini tushuntiradi,** «Fayllar» ekranida esa yaratish, qayta nomlash yoki o‘chirishdan keyingi xato ro‘yxat yangilangan zahoti yo‘qolmaydi.
+- **Serverda nomi band bo‘lgan faylni yuklash endi eskisini yo‘q qilmaydi.** Serverga tashlangan fayl shu nomdagisining o‘rnini egallardi, bekor qilish yoki aloqa uzilishi esa chala yuklangan nusxani o‘chirardi — natijada eski fayl butunlay yo‘qolardi. Endi yuklash keyingi bo‘sh nomni oladi, `hisobot (2).txt`, yuklab olishda bo‘lgani kabi.
+- **macOS'da dastur tugmalar birikmalari Mac'dagi barcha dasturlar kabi Cmd bilan ishlaydi:** ⌘T, ⌘W, ⌘K, ⌘F, ⌘1…9, ⇧⌘D/⇧⌘E, ⇧⌘B, varaqlar esa yana ⇧⌘[ va ⇧⌘] bilan almashadi. Ctrl qobiqqa qoldi: Ctrl+W, Ctrl+K va Ctrl+F har qanday terminaldagidek ishlaydi. Option+strelkalar yana so‘zlar bo‘ylab yuradi — terminalda ham, kiritish maydonlarida ham, varaqlar va panellar esa ⌥⌘+strelkalar bilan almashadi. ⌘W butun oynani barcha sessiyalar bilan emas, varaqni yopadi. Menyudagi maslahatlar Mac belgilarini ko‘rsatadi.
+- **Claude Code to'liq ekran rejimida, tmux va vim'da sichqoncha bilan nusxalash endi buferingizga tushadi.** Bu dasturlar matnni OSC 52 buyrug'i bilan yuboradi, terminal esa uni tushunmasdi. Faqat yozish qabul qilinadi va faqat shu terminal fokusda bo'lganda: server buferingizni o'qiy olmaydi.
+- **Linux'da Ctrl+Shift+C to'g'ridan-to'g'ri tizim buferiga yozadi,** nusxalash xatosi esa yo'qolib ketmay, jurnalga tushadi.
+- **Sekin tarmoqda varaqni yopish, yozish va server chiqishi endi kechikish o'lchovini kutmaydi.** Varaq yonidagi `ms` boshqa hamma narsa bilan bitta navbatda o'lchanardi va yo'qotishli tarmoqda har bir o'lchov sessiyani uch soniyagacha to'xtatardi. O'lchovlar, SFTP, agent buyruqlari va portlarni yo'naltirish endi terminal bilan yonma-yon ishlaydi, javob bermayotgan server bilan xayrlashish esa bir soniyadan oshmaydi.
+- **macOS'da terminalda Option Meta sifatida ishlaydi.** `Option+b` va `Option+f` — qobiqda bir so‘z orqaga va oldinga — ESC-ketma-ketlik o‘rniga maxsus belgi yuborardi, shuning uchun so‘zlar bo‘ylab harakat ishlamasdi. Buning evaziga terminal ichida Option bilan maxsus belgi kiritish (masalan, «é» uchun `Option+e`) endi ishlamaydi.
+- **macOS'da Cmd+C terminalda ajratilganni nusxalaydi.** Avval buni faqat Ctrl+Shift+C va Ctrl+Insert qilardi, tizimdagi tugmalar birikmasi esa hech narsa qilmasdi: terminal ajratishni sahifadan alohida saqlaydi, shuning uchun tizimga nusxalashga narsa yo‘q edi. Hech narsa ajratilmagan bo‘lsa, bosish tizimnikicha qoladi va kiritish maydonlarida nusxalash o‘zgarmaydi. Cmd+V avval ham qo‘yardi — unga tegilmadi.
+- **macOS'da terminalda bufer ishlaydi va hech narsa so‘ramaydi.** O‘qish va yozish sahifa orqali emas, tizim buferi (NSPasteboard) orqali ketadi: dasturning o‘z sxemasida `navigator.clipboard` yo ruxsat so‘raydi, yo yo‘q, rasmni esa umuman bermaydi — shu sababli buferda ekran tasviri bo‘lgan Ctrl+V serverga yetib bormasdi. TIFF ko‘rinishida nusxalangan rasm PNG ga o‘giriladi. Rasm yonidagi matn avvalgidek matn hisoblanadi: serverga faqat aniq rasm bo‘lgani yuboriladi.
+
+### Xavfsizlik
+
+- **Linux'da dastur jurnali va nosozlik hisobotlarini endi kompyuterning boshqa foydalanuvchilari o‘qiy olmaydi.** Papkalar o‘qish uchun ochiq edi (`0755`), jurnal fayllari ham (`0644`), jurnalda esa xost nomlari, manzillar va yo‘llar bor. Endi papkalar `0700`, fayllar `0600`, allaqachon yozilganlari ham.
+
 ## [0.1.1] — 2026-11-05
 
 ### Qo'shildi

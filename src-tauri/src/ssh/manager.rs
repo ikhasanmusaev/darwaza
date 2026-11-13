@@ -88,12 +88,16 @@ impl SshManager {
     }
 
     pub async fn send_cmd(&self, id: Uuid, cmd: super::session::SessionCmd) -> Result<(), String> {
-        let guard = self.sessions.read().await;
-        let handle = guard
+        // Отправитель берём копией и замок отпускаем до отправки: если очередь
+        // этой сессии полна, ждать должна только она, а не все вкладки разом.
+        let cmd_tx = self
+            .sessions
+            .read()
+            .await
             .get(&id)
+            .map(|handle| handle.cmd_tx.clone())
             .ok_or_else(|| format!("session {id} not found"))?;
-        handle
-            .cmd_tx
+        cmd_tx
             .send(cmd)
             .await
             .map_err(|e| format!("session channel closed: {e}"))

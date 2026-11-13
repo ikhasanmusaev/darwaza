@@ -71,24 +71,49 @@ pub(crate) fn unique_path_in(dir: &Path, name: &str) -> PathBuf {
     if !candidate.exists() {
         return candidate;
     }
-    let path = Path::new(name);
-    let stem = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| name.to_string());
-    let ext = path.extension().map(|e| e.to_string_lossy().to_string());
-
     for n in 2..1000 {
-        let candidate_name = match &ext {
-            Some(e) => format!("{stem} ({n}).{e}"),
-            None => format!("{stem} ({n})"),
-        };
-        let candidate = dir.join(candidate_name);
+        let candidate = dir.join(numbered_name(name, n));
         if !candidate.exists() {
             return candidate;
         }
     }
     dir.join(name)
+}
+
+/// «отчёт.txt» → «отчёт (2).txt»: номер перед расширением.
+fn numbered_name(name: &str, n: u32) -> String {
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| name.to_string());
+    match path.extension() {
+        Some(e) => format!("{stem} ({n}).{}", e.to_string_lossy()),
+        None => format!("{stem} ({n})"),
+    }
+}
+
+/// Свободное имя в папке на сервере — то же правило, что и при скачивании.
+///
+/// Без этого загрузка файла с уже существующим именем затирала его, а отмена
+/// или обрыв на середине удаляли недогруженное — то есть прежний файл пропадал
+/// совсем.
+async fn unique_remote_path(
+    sftp: &russh_sftp::client::SftpSession,
+    dir: &str,
+    name: &str,
+) -> Result<String, String> {
+    let first = crate::sftp::join_path(dir, name);
+    if !sftp.try_exists(first.clone()).await.map_err(map_err)? {
+        return Ok(first);
+    }
+    for n in 2..1000 {
+        let candidate = crate::sftp::join_path(dir, &numbered_name(name, n));
+        if !sftp.try_exists(candidate.clone()).await.map_err(map_err)? {
+            return Ok(candidate);
+        }
+    }
+    Err(map_err(format!("в {dir} не нашлось свободного имени для {name}")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -360,7 +385,7 @@ pub async fn transfer_upload(
 ) -> Result<Uuid, String> {
     let sftp = super::sftp::sftp_for(&state, session_id).await?;
     let name = file_name_of(&local_path);
-    let remote_path = crate::sftp::join_path(&remote_dir, &name);
+    let remote_path = unique_remote_path(&sftp, &remote_dir, &name).await?;
 
     let total = tokio::fs::metadata(&local_path).await.ok().map(|m| m.len());
 
@@ -440,7 +465,15 @@ async fn run_upload(
             return Err(msg);
         }
     };
-    let mut remote = match sftp.create(remote_path.to_string()).await {
+    // Только новый файл: даже если между проверкой имени и открытием кто-то
+    // создал такой же, чужое не затрём — получим ошибку.
+    let new_file = russh_sftp::protocol::OpenFlags::CREATE
+        | russh_sftp::protocol::OpenFlags::EXCLUDE
+        | russh_sftp::protocol::OpenFlags::WRITE;
+    let mut remote = match sftp
+        .open_with_flags(remote_path.to_string(), new_file)
+        .await
+    {
         Ok(f) => f,
         Err(e) => {
             let msg = map_err(e);
@@ -606,6 +639,7 @@ async fn tree_side(
 /// Возвращает id сразу; ход — событиями `transfer:progress` (по общему размеру
 /// дерева), отмена — `transfer_cancel`. Подробности правил — `transfers::tree`.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn transfer_tree(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -614,8 +648,11 @@ pub async fn transfer_tree(
     is_dir: bool,
     target: Endpoint,
     target_dir: String,
+    // Что делать с одноимённым на месте назначения; по умолчанию — класть рядом.
+    on_conflict: Option<crate::transfers::tree::OnConflict>,
 ) -> Result<Uuid, String> {
     use crate::transfers::tree::{copy_tree, Outcome};
+    let on_conflict = on_conflict.unwrap_or_default();
 
     let kind = match (&source, &target) {
         (Endpoint::Local, Endpoint::Remote { .. }) => TransferKind::Upload,
@@ -631,6 +668,16 @@ pub async fn transfer_tree(
     };
     let src = tree_side(&state, &source).await?;
     let dst = tree_side(&state, &target).await?;
+
+    // Файл или папка на этом компьютере — смотрим сами: при перетаскивании из
+    // файлового менеджера система отдаёт только пути, и окно этого не знает.
+    let is_dir = match &source {
+        Endpoint::Local => tokio::fs::metadata(&source_path)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(is_dir),
+        Endpoint::Remote { .. } => is_dir,
+    };
 
     // Имя берём по правилам источника: путь сервера всегда через `/`.
     let name = match &source {
@@ -681,6 +728,7 @@ pub async fn transfer_tree(
             is_dir,
             dst.as_ref(),
             &target_dir,
+            on_conflict,
             &cancel,
             &mut on_progress,
         )
@@ -719,4 +767,17 @@ pub async fn transfer_tree(
     });
 
     Ok(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::numbered_name;
+
+    #[test]
+    fn the_number_goes_before_the_extension() {
+        assert_eq!(numbered_name("отчёт.txt", 2), "отчёт (2).txt");
+        assert_eq!(numbered_name("archive.tar.gz", 3), "archive.tar (3).gz");
+        assert_eq!(numbered_name("Makefile", 2), "Makefile (2)");
+        assert_eq!(numbered_name(".bashrc", 2), ".bashrc (2)");
+    }
 }

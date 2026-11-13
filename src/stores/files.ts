@@ -8,6 +8,9 @@ import { errorText } from "../lib/errors";
 import { useSessionsStore } from "./sessions";
 import { useTransfersStore } from "./transfers";
 import type { TreeEndpoint } from "../api/transfers";
+import { useConflictsStore } from "./conflicts";
+import { planTransfers } from "../lib/transferPlan";
+import { nextSelection } from "../lib/selection";
 
 /**
  * Экран SFTP: две панели, в каждой — компьютер или любой сервер (#sftp-screen).
@@ -23,6 +26,8 @@ export interface FileEntry {
   kind: "dir" | "file" | "symlink" | "other";
   size: number;
   modified: number | null;
+  /** Unix-режим; у локальных записей его нет. */
+  permissions?: number | null;
 }
 
 export type Source = { kind: "local" } | { kind: "host"; hostId: number };
@@ -36,7 +41,15 @@ interface Pane {
   loading: boolean;
   connecting: boolean;
   error: string | null;
+  /**
+   * Ошибка правки (папка, имя, удаление). Отдельно от `error`: та заменяет
+   * список, а после неудачной правки список обновляется и стёр бы её.
+   */
+  opError: string | null;
+  /** Последняя щёлкнутая запись: от неё диапазон Shift, её переименовываем. */
   selected: FileEntry | null;
+  /** Все выбранные (Ctrl/⌘ и Shift): их передаём и удаляем. */
+  picked: FileEntry[];
 }
 
 function emptyPane(): Pane {
@@ -48,7 +61,9 @@ function emptyPane(): Pane {
     loading: false,
     connecting: false,
     error: null,
+    opError: null,
     selected: null,
+    picked: [],
   };
 }
 
@@ -63,7 +78,7 @@ export const useFilesStore = defineStore("files", () => {
   const left = ref<Pane>(emptyPane());
   const right = ref<Pane>(emptyPane());
   /** Что тащим между панелями. */
-  const dragging = ref<{ side: Side; entry: FileEntry } | null>(null);
+  const dragging = ref<{ side: Side; entries: FileEntry[] } | null>(null);
 
   /** Свои соединения «только для файлов»: hostId → sessionId. */
   const owned = new Map<number, string>();
@@ -171,10 +186,33 @@ export const useFilesStore = defineStore("files", () => {
       p.entries = res.entries;
       p.path = res.path;
       p.selected = null;
+      p.picked = [];
     } catch (e) {
       p.error = errorText(e);
     } finally {
       p.loading = false;
+    }
+  }
+
+  /** Двойной щелчок: папка — открыть, ссылка — открыть, если она на папку. */
+  async function enter(side: Side, entry: FileEntry): Promise<boolean> {
+    pane(side).opError = null;
+    if (entry.kind === "dir") {
+      await open(side, entry.path);
+      return true;
+    }
+    if (entry.kind !== "symlink") return false;
+    const p = pane(side);
+    try {
+      const res = await list(p, entry.path);
+      p.entries = res.entries;
+      p.path = res.path;
+      p.selected = null;
+      p.picked = [];
+      p.error = null;
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -183,6 +221,7 @@ export const useFilesStore = defineStore("files", () => {
   async function up(side: Side) {
     const p = pane(side);
     if (!p.path) return;
+    p.opError = null;
     const parent =
       p.source?.kind === "local"
         ? await localFsApi.parent(p.path)
@@ -190,16 +229,20 @@ export const useFilesStore = defineStore("files", () => {
     if (parent !== p.path) await open(side, parent);
   }
 
-  /** Обёртка правок: показывает ошибку в панели и обновляет список. */
-  async function edit(side: Side, action: () => Promise<unknown>) {
+  /** Обёртка правок: показывает ошибку над списком и обновляет его. `false` — не вышло. */
+  async function edit(side: Side, action: () => Promise<unknown>): Promise<boolean> {
     const p = pane(side);
     p.error = null;
+    p.opError = null;
+    let ok = true;
     try {
       await action();
     } catch (e) {
-      p.error = errorText(e);
+      p.opError = errorText(e);
+      ok = false;
     }
     await refresh(side);
+    return ok;
   }
 
   const mkdir = (side: Side, name: string) =>
@@ -234,33 +277,66 @@ export const useFilesStore = defineStore("files", () => {
    * Можно ли отправить выбранный файл или папку `from` в папку соседней панели.
    * Годится всё, кроме «компьютер → компьютер»: для него есть файловый менеджер.
    */
-  function canTransfer(from: Side, entry?: FileEntry | null): boolean {
+  const transferable = (e: FileEntry) => e.kind === "file" || e.kind === "dir";
+
+  /** Что передавать: переданные явно или выбранные в панели. */
+  function itemsOf(from: Side, entries?: FileEntry[]): FileEntry[] {
+    const a = pane(from);
+    const items = entries ?? (a.picked.length ? a.picked : a.selected ? [a.selected] : []);
+    return items.filter(transferable);
+  }
+
+  function canTransfer(from: Side, entries?: FileEntry[]): boolean {
     const a = pane(from);
     const b = pane(other(from));
-    const item = entry ?? a.selected;
-    if (!item || (item.kind !== "file" && item.kind !== "dir")) return false;
+    if (itemsOf(from, entries).length === 0) return false;
     if (!a.source || !b.source) return false;
     if (a.source.kind === "local" && b.source.kind === "local") return false;
     return !!b.path && !a.loading && !b.loading;
   }
 
-  async function transfer(from: Side, entry?: FileEntry | null) {
+  /**
+   * Передать выбранное в папку соседней панели. Если там уже есть такие
+   * имена — сначала спросить: заменить, оставить оба или пропустить.
+   */
+  async function transfer(from: Side, entries?: FileEntry[]) {
     const a = pane(from);
     const b = pane(other(from));
-    const item = entry ?? a.selected;
-    if (!item || !canTransfer(from, item)) return;
-    b.error = null;
-    try {
-      await useTransfersStore().startTree(
-        endpoint(a),
-        item.path,
-        item.kind === "dir",
-        endpoint(b),
-        b.path,
-      );
-    } catch (e) {
-      b.error = errorText(e);
+    if (!canTransfer(from, entries)) return;
+    const items = itemsOf(from, entries);
+    const plan = await planTransfers(
+      items,
+      b.entries.map((e) => e.name),
+      useConflictsStore().ask,
+    );
+    b.opError = null;
+    for (const { item, onConflict } of plan) {
+      try {
+        await useTransfersStore().startTree(
+          endpoint(a),
+          item.path,
+          item.kind === "dir",
+          endpoint(b),
+          b.path,
+          onConflict,
+        );
+      } catch (e) {
+        b.opError = errorText(e);
+      }
     }
+  }
+
+  /** Щелчок по записи: одна, Ctrl/⌘ — добавить, Shift — диапазон по видимому списку. */
+  function pick(
+    side: Side,
+    entry: FileEntry,
+    mods: { toggle: boolean; range: boolean },
+    visible: FileEntry[],
+  ) {
+    const p = pane(side);
+    const next = nextSelection(visible, { picked: p.picked, anchor: p.selected }, entry, mods);
+    p.picked = next.picked;
+    p.selected = next.anchor;
   }
 
   /** Передача закончилась — списки могли измениться. */
@@ -277,6 +353,7 @@ export const useFilesStore = defineStore("files", () => {
     init,
     setSource,
     open,
+    enter,
     refresh,
     refreshBoth,
     up,
@@ -285,5 +362,6 @@ export const useFilesStore = defineStore("files", () => {
     remove,
     canTransfer,
     transfer,
+    pick,
   };
 });

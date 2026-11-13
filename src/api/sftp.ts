@@ -53,6 +53,10 @@ export const sftpApi = {
   upload: (sessionId: string, localPath: string, remotePath: string) =>
     invoke<number>("sftp_upload", { sessionId, localPath, remotePath }),
 
+  /** Положить картинку (PNG в base64) на сервер; возвращает путь к файлу. */
+  putClipboardImage: (sessionId: string, data: string) =>
+    invoke<string>("sftp_put_clipboard_image", { sessionId, data }),
+
   /** Закрыть SFTP-подсистему, не трогая терминал этой же сессии. */
   close: (sessionId: string) => invoke<void>("sftp_close", { sessionId }),
 };

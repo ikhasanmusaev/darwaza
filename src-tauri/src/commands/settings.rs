@@ -20,6 +20,7 @@ const WRITABLE_KEYS: &[&str] = &[
     "session.restore_tabs",
     "session.open_hosts",
     "sync.auto",
+    "files.show_hidden",
     crate::commands::probe::PROBE_KEY,
     crate::attention::SETTING_KEY,
 ];
@@ -90,7 +91,7 @@ mod tests {
 
     #[test]
     fn interface_keys_are_writable() {
-        for key in ["app.theme", "hosts.probe", "notify.decision", "sync.auto", "session.open_hosts"] {
+        for key in ["app.theme", "hosts.probe", "notify.decision", "sync.auto", "session.open_hosts", "files.show_hidden"] {
             assert!(check_writable(key).is_ok(), "{key}");
         }
     }

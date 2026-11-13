@@ -195,6 +195,8 @@ test.describe("экран SFTP", () => {
     await page.getByTestId("files-entry-left").filter({ hasText: "app.conf" }).click();
     await expect(page.getByTestId("files-copy-right")).toBeEnabled();
     await page.getByTestId("files-copy-right").click();
+    // На втором сервере в /srv уже есть app.conf — оставляем оба.
+    await page.getByTestId("conflict-rename").click();
     await expect.poll(() => calls).toContain("tree:files-session-1:/srv/app.conf->files-session-2:/srv");
 
     // Правая панель снова на компьютер — её соединение с сервером больше не нужно.
@@ -238,6 +240,46 @@ test.describe("экран SFTP", () => {
     expect(calls.some((c) => c.startsWith("lremove:"))).toBe(false);
     await page.getByRole("button", { name: "O'chirish", exact: true }).click();
     await expect.poll(() => calls).toContain("lremove:/home/tester/notes.txt:false");
+  });
+
+  test("Shift выбирает диапазон, удаление спрашивает про все сразу", async ({ page }) => {
+    const calls: string[] = [];
+    await mockTauriInvoke(page, handlers(calls));
+    await page.goto("/hosts");
+    await openScreen(page);
+
+    const left = page.getByTestId("files-entry-left");
+    await left.filter({ hasText: "Downloads" }).click();
+    await left.filter({ hasText: "notes.txt" }).click({ modifiers: ["Shift"] });
+    // Переименовывать можно только одну запись.
+    await expect(page.getByTestId("files-rename-left")).toBeDisabled();
+
+    await page.getByTestId("files-delete-left").click();
+    await expect(page.getByRole("alertdialog")).toContainText("2");
+    await page.getByRole("button", { name: "O'chirish", exact: true }).click();
+    await expect.poll(() => calls.filter((c) => c.startsWith("lremove:")).sort()).toEqual([
+      "lremove:/home/tester/Downloads:true",
+      "lremove:/home/tester/notes.txt:false",
+    ]);
+  });
+
+  test("непустую папку не удалить — панель объясняет почему, и список на месте", async ({ page }) => {
+    const calls: string[] = [];
+    await mockTauriInvoke(page, {
+      ...handlers(calls),
+      local_remove: () => {
+        throw new Error("DIRECTORY_NOT_EMPTY");
+      },
+    });
+    await page.goto("/hosts");
+    await openScreen(page);
+
+    await page.getByTestId("files-entry-left").filter({ hasText: "Downloads" }).click();
+    await page.getByTestId("files-delete-left").click();
+    await page.getByRole("button", { name: "O'chirish", exact: true }).click();
+
+    await expect(page.getByTestId("files-op-error-left")).toContainText("Faqat bo‘sh papkani");
+    await expect(page.getByTestId("files-entry-left")).toHaveCount(2);
   });
 
   test("папка передаётся целиком в обе стороны, оба компьютера — копирование недоступно", async ({ page }) => {

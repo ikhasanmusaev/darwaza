@@ -1,6 +1,7 @@
 import { defineStore } from "pinia";
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import { sftpApi, type SftpEntry } from "../api/sftp";
+import { useSettingsStore } from "./settings";
 
 function errMessage(e: unknown): string {
   if (e instanceof Error) return e.message;
@@ -55,6 +56,40 @@ export const useSftpStore = defineStore("sftp", () => {
     } finally {
       p.loading = false;
     }
+  }
+
+  /**
+   * Войти в запись по двойному щелчку. Папка — открыть. Ссылка — попробовать
+   * открыть как папку: `/var/www` часто ссылка, и без этого в неё не попасть.
+   * Ссылка на файл список не отдаст — тогда тихо ничего не делаем, ошибка
+   * в панели была бы непонятна. `true` — вошли.
+   */
+  async function enter(sessionId: string, entry: SftpEntry): Promise<boolean> {
+    if (entry.kind === "dir") {
+      await open(sessionId, entry.path);
+      return true;
+    }
+    if (entry.kind !== "symlink") return false;
+    const p = pane(sessionId);
+    try {
+      p.entries = await sftpApi.list(sessionId, entry.path);
+      p.path = entry.path;
+      p.error = null;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Показывать ли скрытые файлы (имя с точки). Одна настройка на обе
+   * файловые панели и на все серверы. По умолчанию показываем: на сервере
+   * `.env` и `.ssh` нужны чаще, чем в домашней папке.
+   */
+  const settings = useSettingsStore();
+  const showHidden = computed(() => settings.get("files.show_hidden") !== "false");
+  async function setShowHidden(value: boolean): Promise<void> {
+    await settings.set("files.show_hidden", value ? "true" : "false");
   }
 
   async function refresh(sessionId: string): Promise<void> {
@@ -122,6 +157,9 @@ export const useSftpStore = defineStore("sftp", () => {
     togglePanel,
     pane,
     open,
+    enter,
+    showHidden,
+    setShowHidden,
     refresh,
     goUp,
     mkdir,

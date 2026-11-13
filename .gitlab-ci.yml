@@ -249,37 +249,10 @@ build:windows:
       - src-tauri/target/release/bundle/nsis/
     expire_in: never
 
-build:macos:
-  stage: build
-  needs: [versions, test:desktop]
-  rules:
-    - if: $CI_COMMIT_TAG
-  allow_failure: true
-  timeout: 1h 30m
-  tags:
-    - saas-macos-medium-m1
-  before_script:
-    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    - source "$HOME/.cargo/env"
-    - corepack enable
-    - pnpm install --frozen-lockfile
-  script:
-    # Сборка под оба процессора: Apple Silicon и Intel. Одного мало —
-    # на чужой машине приложение просто не запустится.
-    - rustup target add aarch64-apple-darwin x86_64-apple-darwin
-    - pnpm tauri build --target universal-apple-darwin
-  artifacts:
-    name: "darwaza-macos-$CI_COMMIT_TAG"
-    paths:
-      - src-tauri/target/universal-apple-darwin/release/bundle/dmg/
-    expire_in: never
-  # ВНИМАНИЕ: сборка НЕ подписана. macOS покажет «программу нельзя открыть,
-  # так как её автор не установлен», и обойти это человек сможет только через
-  # системные настройки. Подпись требует платного Apple Developer ID и
-  # заверения у Apple; переменные APPLE_CERTIFICATE, APPLE_SIGNING_IDENTITY,
-  # APPLE_ID и APPLE_PASSWORD задаются владельцем в настройках проекта, и
-  # Tauri подхватывает их сам. Молчать об этом нельзя: неподписанная сборка
-  # выглядит для человека как сломанная.
+# macOS здесь не собирается: у GitLab на бесплатном тарифе Mac-машин нет, а
+# подпись Developer ID и заверение Apple настроены на GitHub
+# (.github/workflows/macos.yml). Тот запускается сам, когда publish:github
+# создаёт выпуск, и дописывает Mac в releases.json, latest.json и SHA256SUMS.
 
 # Сборка выпуска из всех систем в один каталог. Linux и Windows собираются
 # разными заданиями на разных машинах, и без этого шага Windows-установщик

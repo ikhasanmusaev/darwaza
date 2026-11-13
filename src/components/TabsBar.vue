@@ -24,6 +24,8 @@ import { useLayoutStore } from "../stores/layout";
 import { useCommandPaletteStore } from "../stores/command-palette";
 import { sshApi, type SessionStatus } from "../api/ssh";
 import { errorText } from "../lib/errors";
+import { linkView } from "../lib/linkQuality";
+import { shortcutLabel } from "../lib/platform";
 
 const { t } = useI18n();
 const store = useSessionsStore();
@@ -59,38 +61,79 @@ const canBrowseFiles = computed(
 const isLibraryActive = computed(() => store.activeSessionId === null);
 const dragOverIndex = ref<number | null>(null);
 const latencyMs = ref<number | null>(null);
-let latencyTimer: ReturnType<typeof setInterval> | null = null;
+/** Сколько замеров подряд не удалось: по ним видно, что сеть пропала. */
+const latencyFailures = ref(0);
+const link = computed(() => linkView(latencyMs.value, latencyFailures.value));
+let latencyTimer: ReturnType<typeof setTimeout> | null = null;
+/** Пока прошлый замер не вернулся, новый не шлём: иначе они копятся в очереди. */
+let latencyInFlight = false;
+
+/** Связь в порядке — спрашиваем реже, плохая — чаще, чтобы быстрее увидеть, что ожила. */
+const LATENCY_EVERY_MS = 5000;
+const LATENCY_DEGRADED_EVERY_MS = 2000;
+/** Сам замер ждёт ответа 3 с; здесь — запас на случай, если ответ не придёт вовсе. */
+const LATENCY_GIVE_UP_MS = 4000;
+
+function latencyWithTimeout(id: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("latency timeout")), LATENCY_GIVE_UP_MS);
+    sshApi.latency(id).then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
 
 async function refreshLatency() {
   const id = store.activeSessionId;
-  if (!id || store.activeSession?.status !== "CONNECTED") {
-    latencyMs.value = null;
-    return;
-  }
+  if (!id || store.activeSession?.status !== "CONNECTED") return;
+  if (latencyInFlight) return;
+  latencyInFlight = true;
   try {
-    const value = await sshApi.latency(id);
-    if (store.activeSessionId === id) latencyMs.value = value;
+    const value = await latencyWithTimeout(id);
+    if (store.activeSessionId === id) {
+      latencyMs.value = value;
+      latencyFailures.value = 0;
+    }
   } catch {
-    if (store.activeSessionId === id) latencyMs.value = null;
+    if (store.activeSessionId === id) latencyFailures.value += 1;
+  } finally {
+    latencyInFlight = false;
   }
+}
+
+function scheduleLatency() {
+  if (!store.activeSessionId || store.activeSession?.status !== "CONNECTED") return;
+  const every = link.value.quality === "good" ? LATENCY_EVERY_MS : LATENCY_DEGRADED_EVERY_MS;
+  latencyTimer = setTimeout(async () => {
+    await refreshLatency();
+    scheduleLatency();
+  }, every);
 }
 
 watch(
   () => [store.activeSessionId, store.activeSession?.status] as const,
   () => {
-    if (latencyTimer) clearInterval(latencyTimer);
+    if (latencyTimer) clearTimeout(latencyTimer);
     latencyTimer = null;
     latencyMs.value = null;
-    void refreshLatency();
+    latencyFailures.value = 0;
     if (store.activeSessionId && store.activeSession?.status === "CONNECTED") {
-      latencyTimer = setInterval(() => void refreshLatency(), 5000);
+      void refreshLatency().then(scheduleLatency);
     }
   },
   { immediate: true },
 );
 
 onBeforeUnmount(() => {
-  if (latencyTimer) clearInterval(latencyTimer);
+  if (latencyTimer) clearTimeout(latencyTimer);
+  latencyTimer = null;
 });
 
 /** Переименование вкладки на месте: меняется только подпись вкладки, не хост. */
@@ -327,7 +370,7 @@ function onDrop(e: DragEvent, toIndex: number) {
       type="button"
       data-testid="bookmark-add"
       class="mr-1 inline-flex items-center justify-center w-7 h-7 rounded-r6 text-on-surface-muted hover:bg-surface-alt hover:text-warning"
-      :title="t('bookmarks.add')"
+      :title="t('bookmarks.add', { keys: shortcutLabel('Shift', 'B') })"
       @click="store.activeSessionId && bookmarks.addHere(store.activeSessionId)"
     >
       <Bookmark :size="14" />
@@ -380,16 +423,21 @@ function onDrop(e: DragEvent, toIndex: number) {
       @click="palette.open"
     >
       <Search :size="14" />
-      <kbd class="font-mono text-[10px]">Ctrl K</kbd>
+      <kbd class="font-mono text-[10px]">{{ shortcutLabel("K") }}</kbd>
     </button>
 
     <div
       v-if="store.activeSession?.status === 'CONNECTED'"
-      class="ml-2 mr-1 font-mono text-mono text-success-text shrink-0"
+      class="ml-2 mr-1 font-mono text-mono shrink-0"
+      :class="{
+        'text-success-text': link.quality === 'good',
+        'text-warning-text': link.quality === 'slow',
+        'text-danger-text': link.quality === 'bad',
+      }"
+      :data-quality="link.quality"
       data-testid="connection-latency"
     >
-      {{ t("session.status.CONNECTED")
-      }}<template v-if="latencyMs !== null"> · {{ latencyMs }} ms</template>
+      {{ t(link.label) }}<template v-if="link.ms !== null"> · {{ link.ms }} ms</template>
     </div>
   </div>
 </template>
