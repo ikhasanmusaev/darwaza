@@ -45,7 +45,7 @@ jobs:
   build:
     # Пробные метки vX.Y.Z-rcN GitLab на витрину не выкладывает — и мы не собираем.
     if: ${{ github.event_name != 'release' || !contains(github.event.release.tag_name, '-rc') }}
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 90
     env:
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
