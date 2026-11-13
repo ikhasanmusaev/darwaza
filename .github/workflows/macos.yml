@@ -101,9 +101,29 @@ jobs:
           printf '%s\n' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
           echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
 
+      # Универсальная сборка: Tauri собирает обе архитектуры, но склеивает (lipo)
+      # только главную программу. Вторую, darwaza-mcp, он при упаковке ищет уже
+      # склеенной и без этого шага падает: «darwaza-mcp does not exist».
+      # Поэтому сборка и упаковка разделены, а склейка — между ними.
+      - name: Сборка под оба процессора
+        run: pnpm tauri build --target universal-apple-darwin --no-bundle
+
+      - name: darwaza-mcp под оба процессора
+        working-directory: src-tauri
+        run: |
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            # Если Tauri её уже собрал, cargo ничего не пересобирает.
+            cargo build --release --bin darwaza-mcp --target "$t"
+          done
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create -output target/universal-apple-darwin/release/darwaza-mcp \
+            target/aarch64-apple-darwin/release/darwaza-mcp \
+            target/x86_64-apple-darwin/release/darwaza-mcp
+          lipo -info target/universal-apple-darwin/release/darwaza-mcp
+
       # Tauri сам заводит временную связку ключей с сертификатом, подписывает
       # приложение (hardened runtime), отправляет его Apple и прикрепляет ответ.
-      - name: Сборка, подпись и заверение
+      - name: Упаковка, подпись и заверение
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -112,7 +132,7 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: pnpm tauri build --target universal-apple-darwin
+        run: pnpm tauri bundle --target universal-apple-darwin
 
       - name: Ключ App Store Connect убрать
         if: always()
